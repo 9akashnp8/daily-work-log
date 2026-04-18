@@ -122,6 +122,53 @@
     if (e.key === 'Enter')  { e.preventDefault(); saveEdit(); }
     if (e.key === 'Escape') { cancelEdit(); }
   }
+
+  // ─── AI Summary ───────────────────────────────────────────────────────────
+
+  let summarizing  = $state(false);
+  let summary      = $state('');
+  let summaryError = $state('');
+  let copied       = $state(false);
+
+  const weekEntries = $derived(weekDays.flatMap(d => entriesForDay(d)));
+
+  // Key per week: "worklog_report_2026-04-13"
+  const reportKey = $derived(`worklog_report_${weekDays[0]}`);
+
+  // Load saved report whenever the week changes
+  $effect(() => {
+    summary = browser ? (localStorage.getItem(reportKey) ?? '') : '';
+    summaryError = '';
+  });
+
+  function persistReport(text) {
+    if (browser) localStorage.setItem(reportKey, text);
+  }
+
+  async function generateSummary() {
+    summarizing = true; summaryError = ''; summary = '';
+    try {
+      const res = await fetch('/api/summarize', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ entries: weekEntries, weekLabel })
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.message ?? 'Request failed');
+      summary = data.summary;
+      persistReport(summary);
+    } catch (e) {
+      summaryError = e.message;
+    } finally {
+      summarizing = false;
+    }
+  }
+
+  async function copyToClipboard() {
+    await navigator.clipboard.writeText(summary);
+    copied = true;
+    setTimeout(() => { copied = false; }, 2000);
+  }
 </script>
 
 <main>
@@ -275,6 +322,44 @@
             <strong>{s.count}</strong>
           </div>
         {/each}
+      </div>
+
+      <!-- ── AI Summary ─────────────────────────────────────────────── -->
+      <div class="ai-section">
+        <button
+          class="summarize-btn"
+          onclick={generateSummary}
+          disabled={summarizing || weekEntries.length === 0}
+        >
+          {#if summarizing}
+            <span class="spinner"></span> Generating…
+          {:else if summary}
+            ↺ Regenerate Summary
+          {:else}
+            ✨ Generate Summary
+          {/if}
+        </button>
+
+        {#if summaryError}
+          <p class="summary-error">⚠ {summaryError}</p>
+        {/if}
+
+        {#if summary}
+          <div class="summary-output">
+            <div class="summary-toolbar">
+              <span class="summary-label">AI Summary</span>
+              <button class="copy-btn" onclick={copyToClipboard}>
+                {copied ? '✓ Copied!' : 'Copy'}
+              </button>
+            </div>
+            <textarea
+              class="summary-text"
+              bind:value={summary}
+              oninput={() => persistReport(summary)}
+              spellcheck="false"
+            ></textarea>
+          </div>
+        {/if}
       </div>
     </section>
 
@@ -697,6 +782,108 @@
   :global(.status-next-week)   { background: #dbeafe; color: #1d4ed8; }
   :global(.status-blocker)     { background: #fee2e2; color: #dc2626; }
   :global(.status-achievement) { background: #fef3c7; color: #b45309; }
+
+  /* ── AI Summary ───────────────────────────────────────────────────── */
+  .ai-section {
+    display: flex;
+    flex-direction: column;
+    gap: 0.75rem;
+  }
+
+  .summarize-btn {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 0.4rem;
+    padding: 0.625rem 1rem;
+    background: var(--surface);
+    color: #7c3aed;
+    border: 1px dashed #c4b5fd;
+    border-radius: 0.5rem;
+    font-size: 0.875rem;
+    font-weight: 600;
+    cursor: pointer;
+    transition: background 0.15s, border-color 0.15s;
+  }
+
+  .summarize-btn:hover:not(:disabled) { background: #faf5ff; border-color: #a78bfa; }
+  .summarize-btn:disabled { opacity: 0.45; cursor: not-allowed; }
+
+  /* spinner */
+  .spinner {
+    width: 0.875rem;
+    height: 0.875rem;
+    border: 2px solid #c4b5fd;
+    border-top-color: #7c3aed;
+    border-radius: 50%;
+    animation: spin 0.7s linear infinite;
+    flex-shrink: 0;
+  }
+  @keyframes spin { to { transform: rotate(360deg); } }
+
+  .summary-error {
+    font-size: 0.8125rem;
+    color: #dc2626;
+    background: #fee2e2;
+    border: 1px solid #fca5a5;
+    border-radius: 0.4rem;
+    padding: 0.5rem 0.75rem;
+  }
+
+  .summary-output {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 0.625rem;
+    overflow: hidden;
+  }
+
+  .summary-toolbar {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 0.5rem 1rem;
+    background: var(--surface-alt);
+    border-bottom: 1px solid var(--border);
+  }
+
+  .summary-label {
+    font-size: 0.75rem;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    color: var(--text-faint);
+  }
+
+  .copy-btn {
+    background: none;
+    border: 1px solid var(--border);
+    border-radius: 0.3rem;
+    padding: 0.2rem 0.6rem;
+    font-size: 0.75rem;
+    font-weight: 600;
+    color: var(--text-muted);
+    cursor: pointer;
+    transition: background 0.15s, color 0.15s;
+  }
+  .copy-btn:hover { background: var(--nav-hover); color: var(--text); }
+
+  .summary-text {
+    display: block;
+    width: 100%;
+    white-space: pre-wrap;
+    font-family: inherit;
+    font-size: 0.875rem;
+    line-height: 1.6;
+    color: var(--text);
+    background: var(--surface);
+    border: none;
+    outline: none;
+    padding: 1rem 1.25rem;
+    min-height: 16rem;
+    max-height: 32rem;
+    resize: vertical;
+    overflow-y: auto;
+  }
 
   /* ── Responsive ────────────────────────────────────────────────────── */
   @media (max-width: 800px) {

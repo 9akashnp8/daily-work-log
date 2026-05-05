@@ -1,6 +1,5 @@
 <script>
   import { page } from '$app/stores';
-  import { browser } from '$app/environment';
   import { parseSections, formatSlideDate, prevWeekMonday } from '$lib/parseSections.js';
 
   /**
@@ -24,11 +23,29 @@
   }
 
   // ── Read week from URL query param (?week=2026-04-13) ────────────────────
-  const weekStart   = $derived($page.url.searchParams.get('week') ?? '');
-  const prevStart   = $derived(weekStart ? prevWeekMonday(weekStart) : '');
+  const weekStart = $derived($page.url.searchParams.get('week') ?? '');
+  const prevStart = $derived(weekStart ? prevWeekMonday(weekStart) : '');
 
-  const reportText  = $derived(browser && weekStart ? (localStorage.getItem(`worklog_report_${weekStart}`) ?? '') : '');
-  const prevText    = $derived(browser && prevStart  ? (localStorage.getItem(`worklog_report_${prevStart}`)  ?? '') : '');
+  let reportText = $state('');
+  let prevText   = $state('');
+
+  $effect(() => {
+    if (!weekStart) return;
+    reportText = '';
+    fetch(`/api/reports?week=${weekStart}`)
+      .then(r => r.json())
+      .then(d => { if (d.summary) reportText = d.summary; })
+      .catch(() => {});
+  });
+
+  $effect(() => {
+    if (!prevStart) return;
+    prevText = '';
+    fetch(`/api/reports?week=${prevStart}`)
+      .then(r => r.json())
+      .then(d => { if (d.summary) prevText = d.summary; })
+      .catch(() => {});
+  });
 
   const sections     = $derived(reportText ? parseSections(reportText) : null);
   const prevSections = $derived(prevText   ? parseSections(prevText)   : null);

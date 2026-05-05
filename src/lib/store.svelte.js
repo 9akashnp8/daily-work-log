@@ -8,39 +8,66 @@ export const STATUSES = [
   { value: 'achievement', label: 'Achievement' }
 ];
 
-const STORAGE_KEY = 'worklog_entries';
-
 class WorklogStore {
   entries = $state([]);
+  loading = $state(false);
+  error   = $state(null);
 
-  constructor() {
-    if (typeof localStorage !== 'undefined') {
-      try {
-        this.entries = JSON.parse(localStorage.getItem(STORAGE_KEY) || '[]');
-      } catch {
-        this.entries = [];
-      }
+  async loadWeek(weekMonday) {
+    this.loading = true;
+    this.error = null;
+    try {
+      const res = await fetch(`/api/entries?week=${weekMonday}`);
+      if (!res.ok) throw new Error('Failed to load entries');
+      const { entries } = await res.json();
+      this.entries = entries;
+    } catch (e) {
+      this.error = e.message;
+    } finally {
+      this.loading = false;
     }
   }
 
-  add(entry) {
+  async add(entry) {
     this.entries.push(entry);
-    this.#save();
+    try {
+      const res = await fetch('/api/entries', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(entry)
+      });
+      if (!res.ok) throw new Error('Failed to save entry');
+    } catch (e) {
+      this.entries = this.entries.filter(x => x.id !== entry.id);
+      this.error = e.message;
+    }
   }
 
-  update(id, changes) {
+  async update(id, changes) {
+    const prev = this.entries.find(e => e.id === id);
     this.entries = this.entries.map(e => e.id === id ? { ...e, ...changes } : e);
-    this.#save();
+    try {
+      const res = await fetch(`/api/entries/${id}`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(changes)
+      });
+      if (!res.ok) throw new Error('Failed to update entry');
+    } catch (e) {
+      if (prev) this.entries = this.entries.map(e => e.id === id ? prev : e);
+      this.error = e.message;
+    }
   }
 
-  delete(id) {
+  async delete(id) {
+    const prev = this.entries.find(e => e.id === id);
     this.entries = this.entries.filter(e => e.id !== id);
-    this.#save();
-  }
-
-  #save() {
-    if (typeof localStorage !== 'undefined') {
-      localStorage.setItem(STORAGE_KEY, JSON.stringify(this.entries));
+    try {
+      const res = await fetch(`/api/entries/${id}`, { method: 'DELETE' });
+      if (!res.ok) throw new Error('Failed to delete entry');
+    } catch (e) {
+      if (prev) this.entries.push(prev);
+      this.error = e.message;
     }
   }
 }

@@ -51,6 +51,7 @@
   let formDesc     = $state('');
   let formCategory = $state(CATEGORIES[0]);
   let formStatus   = $state(STATUSES[0].value);
+  let activeTab    = $state('week'); // 'form' | 'week'
 
   // Dark mode
   let dark = $state(browser ? localStorage.getItem('theme') === 'dark' : false);
@@ -69,6 +70,11 @@
   const weekDays  = $derived(getWeekDays(weekOffset));
   const weekLabel = $derived(formatWeekLabel(weekDays));
 
+  // Load entries whenever the week changes
+  $effect(() => {
+    store.loadWeek(weekDays[0]);
+  });
+
   function entriesForDay(day) {
     return store.entries.filter(e => e.date === day);
   }
@@ -82,19 +88,24 @@
 
   // ─── Add entry ────────────────────────────────────────────────────────────
 
-  function addEntry() {
+  async function addEntry() {
     const lines = formDesc.split('\n').map(l => l.trim()).filter(Boolean);
     if (!lines.length) return;
-    lines.forEach((line, i) => {
-      store.add({
-        id: `${Date.now()}-${i}-${Math.random().toString(36).slice(2, 7)}`,
-        date: formDate,
-        description: line,
-        category: formCategory,
-        status: formStatus
-      });
-    });
+    const adds = lines.map((line, i) => ({
+      id: `${Date.now()}-${i}-${Math.random().toString(36).slice(2, 7)}`,
+      date: formDate,
+      description: line,
+      category: formCategory,
+      status: formStatus
+    }));
     formDesc = '';
+    for (const entry of adds) {
+      await store.add(entry);
+    }
+    // Switch to week view on mobile after adding
+    if (browser && window.matchMedia('(max-width: 800px)').matches) {
+      activeTab = 'week';
+    }
   }
 
   function handleKeydown(e) {
@@ -132,21 +143,28 @@
 
   const weekEntries = $derived(weekDays.flatMap(d => entriesForDay(d)));
 
-  // Key per week: "worklog_report_2026-04-13"
-  const reportKey = $derived(`worklog_report_${weekDays[0]}`);
-
   // Load saved report whenever the week changes
   $effect(() => {
-    summary = browser ? (localStorage.getItem(reportKey) ?? '') : '';
+    const week = weekDays[0];
+    summary = '';
     summaryError = '';
+    fetch(`/api/reports?week=${week}`)
+      .then(r => r.json())
+      .then(d => { if (d.summary) summary = d.summary; })
+      .catch(() => {});
   });
 
-  function persistReport(text) {
-    if (browser) localStorage.setItem(reportKey, text);
+  async function persistReport(week, text) {
+    await fetch('/api/reports', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ week, summary: text })
+    });
   }
 
   async function generateSummary() {
     summarizing = true; summaryError = ''; summary = '';
+    const week = weekDays[0];
     try {
       const res = await fetch('/api/summarize', {
         method: 'POST',
@@ -156,7 +174,7 @@
       const data = await res.json();
       if (!res.ok) throw new Error(data.message ?? 'Request failed');
       summary = data.summary;
-      persistReport(summary);
+      await persistReport(week, summary);
     } catch (e) {
       summaryError = e.message;
     } finally {
@@ -180,10 +198,20 @@
     </button>
   </header>
 
+  <!-- Mobile tab bar -->
+  <div class="mobile-tabs">
+    <button class:active={activeTab === 'form'} onclick={() => activeTab = 'form'}>
+      Add Entry
+    </button>
+    <button class:active={activeTab === 'week'} onclick={() => activeTab = 'week'}>
+      This Week
+    </button>
+  </div>
+
   <div class="layout">
 
     <!-- ── Add Entry Form ──────────────────────────────────────────── -->
-    <aside class="form-panel">
+    <aside class="form-panel" class:hidden-mobile={activeTab !== 'form'}>
       <form onsubmit={(e) => { e.preventDefault(); addEntry(); }}>
         <h2>Log Entry</h2>
 
@@ -253,12 +281,20 @@
     </aside>
 
     <!-- ── Weekly View ─────────────────────────────────────────────── -->
-    <section class="week-panel">
+    <section class="week-panel" class:hidden-mobile={activeTab !== 'week'}>
       <div class="week-nav">
         <button onclick={() => weekOffset--}>&#8592;</button>
         <span class="week-label">{weekLabel}</span>
         <button onclick={() => weekOffset++}>&#8594;</button>
       </div>
+
+      {#if store.loading}
+        <div class="loading-bar">Loading…</div>
+      {/if}
+
+      {#if store.error}
+        <p class="store-error">⚠ {store.error}</p>
+      {/if}
 
       <div class="days">
         {#each weekDays as day}
@@ -361,7 +397,7 @@
             <textarea
               class="summary-text"
               bind:value={summary}
-              oninput={() => persistReport(summary)}
+              oninput={() => persistReport(weekDays[0], summary)}
               spellcheck="false"
             ></textarea>
           </div>
@@ -463,6 +499,12 @@
   }
   .theme-btn:hover { background: var(--nav-hover); border-color: var(--text-faint); }
 
+  /* ── Mobile tab bar ────────────────────────────────────────────────── */
+  .mobile-tabs {
+    display: none;
+  }
+
+  /* ── Layout grid ───────────────────────────────────────────────────── */
   .layout {
     display: grid;
     grid-template-columns: 300px 1fr;
@@ -609,6 +651,26 @@
   .week-nav button:hover { background: var(--nav-hover); border-color: var(--text-faint); }
 
   .week-label { flex: 1; text-align: center; font-weight: 600; font-size: 0.9375rem; }
+
+  /* ── Loading / error ───────────────────────────────────────────────── */
+  .loading-bar {
+    text-align: center;
+    font-size: 0.8125rem;
+    color: var(--text-faint);
+    padding: 0.5rem;
+    background: var(--surface-alt);
+    border: 1px solid var(--border);
+    border-radius: 0.4rem;
+  }
+
+  .store-error {
+    font-size: 0.8125rem;
+    color: #dc2626;
+    background: #fee2e2;
+    border: 1px solid #fca5a5;
+    border-radius: 0.4rem;
+    padding: 0.5rem 0.75rem;
+  }
 
   /* ── Days ──────────────────────────────────────────────────────────── */
   .days { display: flex; flex-direction: column; gap: 0.5rem; }
@@ -897,6 +959,62 @@
 
   /* ── Responsive ────────────────────────────────────────────────────── */
   @media (max-width: 800px) {
-    .layout { grid-template-columns: 1fr; padding: 1rem; }
+    header { padding: 0.875rem 1rem; }
+
+    .mobile-tabs {
+      display: flex;
+      position: sticky;
+      top: 0;
+      z-index: 10;
+      background: var(--surface);
+      border-bottom: 1px solid var(--border);
+    }
+
+    .mobile-tabs button {
+      flex: 1;
+      padding: 0.875rem;
+      font-size: 0.9375rem;
+      font-weight: 600;
+      border: none;
+      background: none;
+      color: var(--text-muted);
+      cursor: pointer;
+      border-bottom: 2px solid transparent;
+      transition: color 0.15s, border-color 0.15s;
+    }
+
+    .mobile-tabs button.active {
+      color: #2563eb;
+      border-bottom-color: #2563eb;
+    }
+
+    .layout {
+      grid-template-columns: 1fr;
+      padding: 0.75rem 1rem;
+      gap: 0.75rem;
+    }
+
+    .hidden-mobile { display: none; }
+
+    /* Larger touch targets for edit/delete */
+    .edit-btn,
+    .del-btn {
+      opacity: 1;
+      padding: 0.5rem;
+      min-width: 2.25rem;
+      min-height: 2.25rem;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+    }
+
+    /* Taller textarea on mobile */
+    textarea { min-height: 6rem; }
+
+    /* Bigger submit button */
+    button[type='submit'] {
+      padding: 0.875rem;
+      font-size: 1rem;
+    }
   }
 </style>

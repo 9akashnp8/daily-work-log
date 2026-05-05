@@ -169,6 +169,7 @@
     copied = true;
     setTimeout(() => { copied = false; }, 2000);
   }
+
 </script>
 
 <main>
@@ -348,9 +349,14 @@
           <div class="summary-output">
             <div class="summary-toolbar">
               <span class="summary-label">AI Summary</span>
-              <button class="copy-btn" onclick={copyToClipboard}>
-                {copied ? '✓ Copied!' : 'Copy'}
-              </button>
+              <div class="summary-actions">
+                <button class="copy-btn" onclick={copyToClipboard}>
+                  {copied ? '✓ Copied!' : 'Copy'}
+                </button>
+                <button class="copy-btn export-btn" onclick={() => window.open(`/print?week=${weekDays[0]}`, '_blank')}>
+                  ↗ Open as Slide
+                </button>
+              </div>
             </div>
             <textarea
               class="summary-text"
@@ -836,6 +842,10 @@
     border-radius: 0.625rem;
     overflow: hidden;
   }
+
+  .summary-actions { display: flex; gap: 0.375rem; }
+
+  .export-btn { font-weight: 600; }
 
   .summary-toolbar {
     display: flex;

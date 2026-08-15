@@ -1,5 +1,6 @@
 import postgres from 'postgres';
 import { readFileSync } from 'fs';
+import "dotenv/config";
 
 const sql = postgres(process.env.DATABASE_URL, { ssl: 'require' });
 
@@ -24,6 +25,29 @@ await sql`
     summary      TEXT        NOT NULL,
     generated_at TIMESTAMPTZ NOT NULL DEFAULT now()
   )
+`;
+
+// ── Jira sync columns ──────────────────────────────────────────────
+await sql`ALTER TABLE worklog_entries ADD COLUMN IF NOT EXISTS source      TEXT NOT NULL DEFAULT 'manual'`;
+await sql`ALTER TABLE worklog_entries ADD COLUMN IF NOT EXISTS jira_key    TEXT`;
+await sql`ALTER TABLE worklog_entries ADD COLUMN IF NOT EXISTS jira_url    TEXT`;
+await sql`ALTER TABLE worklog_entries ADD COLUMN IF NOT EXISTS issue_type  TEXT`;
+await sql`ALTER TABLE worklog_entries ADD COLUMN IF NOT EXISTS epic        TEXT`;
+await sql`ALTER TABLE worklog_entries ADD COLUMN IF NOT EXISTS project     TEXT`;
+await sql`ALTER TABLE worklog_entries ADD COLUMN IF NOT EXISTS domain      TEXT`;
+await sql`ALTER TABLE worklog_entries ADD COLUMN IF NOT EXISTS labels      TEXT`;
+await sql`ALTER TABLE worklog_entries ADD COLUMN IF NOT EXISTS details     TEXT`;
+await sql`ALTER TABLE worklog_entries ADD COLUMN IF NOT EXISTS user_edited BOOLEAN NOT NULL DEFAULT false`;
+await sql`ALTER TABLE worklog_entries ADD COLUMN IF NOT EXISTS synced_at   TIMESTAMPTZ`;
+
+await sql`CREATE INDEX IF NOT EXISTS idx_worklog_entries_jira_key ON worklog_entries (jira_key)`;
+await sql`CREATE INDEX IF NOT EXISTS idx_worklog_entries_source   ON worklog_entries (source, date)`;
+
+// One Jira issue can only produce one row per day (belt-and-braces alongside
+// the deterministic id `jira:{key}:{date}` used by the sync route).
+await sql`
+  CREATE UNIQUE INDEX IF NOT EXISTS uq_worklog_entries_jira_day
+  ON worklog_entries (jira_key, date) WHERE source = 'jira'
 `;
 
 console.log('Tables created.');

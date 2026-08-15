@@ -13,6 +13,66 @@ class WorklogStore {
   loading = $state(false);
   error   = $state(null);
 
+  syncing     = $state(false);
+  syncPreview = $state(null);
+  syncError   = $state(null);
+  syncEnabled = $state(false);
+
+  async checkSyncEnabled() {
+    try {
+      const res = await fetch('/api/sync/jira');
+      if (!res.ok) return;
+      const { configured } = await res.json();
+      this.syncEnabled = configured;
+    } catch {
+      this.syncEnabled = false;
+    }
+  }
+
+  async previewSync(week) {
+    this.syncing = true;
+    this.syncError = null;
+    try {
+      const res = await fetch('/api/sync/jira', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ week, mode: 'preview' })
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.message || 'Failed to preview Jira sync');
+      this.syncPreview = data;
+    } catch (e) {
+      this.syncError = e.message;
+    } finally {
+      this.syncing = false;
+    }
+  }
+
+  async applySync(week) {
+    this.syncing = true;
+    this.syncError = null;
+    try {
+      const res = await fetch('/api/sync/jira', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ week, mode: 'apply' })
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.message || 'Failed to apply Jira sync');
+      this.entries = data.entries;
+      this.syncPreview = null;
+    } catch (e) {
+      this.syncError = e.message;
+    } finally {
+      this.syncing = false;
+    }
+  }
+
+  cancelSync() {
+    this.syncPreview = null;
+    this.syncError = null;
+  }
+
   async loadWeek(weekMonday) {
     this.loading = true;
     this.error = null;
@@ -73,3 +133,7 @@ class WorklogStore {
 }
 
 export const store = new WorklogStore();
+
+export function distinctValues(entries, key) {
+  return [...new Set(entries.map((e) => e[key]).filter(Boolean))].sort();
+}

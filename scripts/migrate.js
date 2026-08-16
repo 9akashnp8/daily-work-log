@@ -55,6 +55,16 @@ await sql`ALTER TABLE worklog_entries ADD COLUMN IF NOT EXISTS parent_summary   
 await sql`ALTER TABLE worklog_entries ADD COLUMN IF NOT EXISTS parent_issue_type TEXT`;
 await sql`ALTER TABLE worklog_entries ADD COLUMN IF NOT EXISTS parent_url        TEXT`;
 
+// ── Entry provenance ───────────────────────────────────────────────
+// How a row came to exist: 'comment' (you wrote a note), 'transition' (the
+// card moved), 'flagged', or 'continued' (the silent-ticket fallback — the
+// issue was open all week but you touched nothing). The summarizer needs
+// this to tell real work from a placeholder. NULL means unknown, not
+// 'continued': rows written before this column existed, and hand-edited
+// rows (which the sync's user_edited guard never overwrites), both stay
+// NULL and must be treated as genuine work.
+await sql`ALTER TABLE worklog_entries ADD COLUMN IF NOT EXISTS signal TEXT`;
+
 await sql`CREATE INDEX IF NOT EXISTS idx_worklog_entries_jira_key ON worklog_entries (jira_key)`;
 await sql`CREATE INDEX IF NOT EXISTS idx_worklog_entries_source   ON worklog_entries (source, date)`;
 

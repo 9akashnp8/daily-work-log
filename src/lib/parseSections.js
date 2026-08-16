@@ -26,10 +26,45 @@ const SECTION_KEYS = [
   'Action Items',
 ];
 
+const normalise = (s) => s.toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim();
+
+/**
+ * Resolve a heading to one of SECTION_KEYS.
+ *
+ * Exact (normalised) match first, then a *best-scoring* fuzzy match. Scoring
+ * matters: the previous first-match-wins scan routed "Action Items & Next
+ * Steps" into "Plan for Next Week" on the strength of `next` alone, silently
+ * emptying Action Items. Counting overlapping words instead lets "action" +
+ * "items" (2) beat "next" (1). Ties keep SECTION_KEYS order.
+ *
+ * The prompt now pins the headings verbatim, so this is a safety net for a
+ * model that reworded one — not the primary defence.
+ */
+function matchSection(title) {
+  const norm = normalise(title);
+
+  const exact = SECTION_KEYS.find(k => normalise(k) === norm);
+  if (exact) return exact;
+
+  let best = null;
+  let bestScore = 0;
+
+  for (const k of SECTION_KEYS) {
+    const words = normalise(k).split(' ').filter(w => w.length > 3);
+    // Word-boundary check: "week" must not match inside "weekly"
+    const score = words.filter(w => new RegExp(`\\b${w}\\b`).test(norm)).length;
+    if (score > bestScore) {
+      bestScore = score;
+      best = k;
+    }
+  }
+
+  return best;
+}
+
 /**
  * Parse an AI summary into a map of section → bullet array.
  * Handles both **Header** and ## Header styles.
- * Uses word-boundary matching so e.g. "week" doesn't match inside "weekly".
  */
 export function parseSections(text) {
   const result = Object.fromEntries(SECTION_KEYS.map(k => [k, []]));
@@ -45,12 +80,7 @@ export function parseSections(text) {
       trimmed.match(/^#{1,3}\s+(.+)$/);
 
     if (headerMatch) {
-      const title = headerMatch[1].trim().toLowerCase();
-      current = SECTION_KEYS.find(k => {
-        const words = k.toLowerCase().split(/[\s&]+/).filter(w => w.length > 3);
-        // Word-boundary check: "week" must not match inside "weekly"
-        return words.some(w => new RegExp(`\\b${w}\\b`).test(title));
-      }) ?? null;
+      current = matchSection(headerMatch[1]);
       continue;
     }
 

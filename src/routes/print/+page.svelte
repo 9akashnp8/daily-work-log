@@ -335,9 +335,6 @@
     min-height: 0;
   }
 
-  /* Updates in Detail gets more space in left col */
-  .updates-box { flex: 2; }
-
   /* ── Section boxes ───────────────────────────────────────────────── */
   .section-box {
     border: 1.5px dashed #1a3560;
@@ -348,6 +345,13 @@
     min-height: 0;
     overflow: hidden;
   }
+
+  /* Updates in Detail gets more space in left col.
+     MUST stay after `.section-box` — both selectors have the same
+     specificity, so whichever is declared last wins. Sitting above it, this
+     rule was silently overridden by `flex: 1` and Updates rendered the same
+     height as Action Items, clipping its last bullets on a busy week. */
+  .updates-box { flex: 2; }
 
   .section-label {
     position: absolute;

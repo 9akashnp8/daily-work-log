@@ -46,23 +46,6 @@ function statusMap() {
   return override ? { ...DEFAULT_STATUS_MAP, ...override } : DEFAULT_STATUS_MAP;
 }
 
-const DEFAULT_CATEGORY_MAP = {
-  bug: 'Bug Fix',
-  defect: 'Bug Fix',
-  incident: 'Bug Fix',
-  support: 'Bug Fix',
-  story: 'Feature',
-  task: 'Feature',
-  'new feature': 'Feature',
-  improvement: 'Feature',
-  epic: 'Feature',
-  spike: 'Research',
-  research: 'Research',
-  meeting: 'Meeting'
-};
-
-const GENERIC_SUBTASK_TYPES = new Set(['sub-task', 'subtask', 'sub task']);
-
 const DEFAULT_DOMAIN_LABELS = [
   'backend',
   'frontend',
@@ -77,8 +60,8 @@ const DEFAULT_DOMAIN_LABELS = [
   'security'
 ];
 
-const DEFAULT_DOMAIN_PREFIXES = ['domain', 'area', 'team'];
-const DEFAULT_PROJECT_PREFIXES = ['project', 'proj', 'client'];
+const DEFAULT_DOMAIN_PREFIXES = ['t', 'domain', 'area', 'team'];
+const DEFAULT_PROJECT_PREFIXES = ['p', 'project', 'proj', 'client'];
 const DEFAULT_ACHIEVEMENT_LABELS = ['achievement', 'milestone', 'launch', 'released'];
 const DEFAULT_BLOCKER_LABELS = ['blocked', 'blocker', 'impediment'];
 
@@ -124,21 +107,6 @@ function resolveStatusForTransition(toName, issue, warnings) {
   return fallback;
 }
 
-function issueTypeName(issue) {
-  return issue.fields.issuetype?.name ?? '';
-}
-
-function resolveCategory(issue, parentIssueType) {
-  let typeName = issueTypeName(issue).trim().toLowerCase();
-  const isSubtask = Boolean(issue.fields.issuetype?.subtask) || issue.fields.issuetype?.hierarchyLevel === -1;
-
-  if (isSubtask && GENERIC_SUBTASK_TYPES.has(typeName) && parentIssueType) {
-    typeName = parentIssueType.trim().toLowerCase();
-  }
-
-  return DEFAULT_CATEGORY_MAP[typeName] ?? 'Other';
-}
-
 function splitPrefixedLabel(label, prefixes) {
   const idx = label.indexOf(':');
   if (idx === -1) return null;
@@ -154,15 +122,22 @@ function resolveDomainAndProject(labels, projectName, warnings, unmatchedLabels)
 
   let domain = null;
   let project = null;
+  // Labels that were actually consumed as a project/domain signal — excluded
+  // from the unmatched-label warning below. Anything else with an unrecognised
+  // `prefix:value` shape (e.g. a typo'd domain prefix) is left in, so it
+  // surfaces as a warning instead of vanishing silently.
+  const consumed = new Set();
 
   for (const label of labels) {
     if (!project) {
       const v = splitPrefixedLabel(label, projectPrefixes);
-      if (v) project = v;
+      if (v) { project = v; consumed.add(label); }
     }
     if (!domain) {
       const v = splitPrefixedLabel(label, domainPrefixes);
-      if (v) domain = v;
+      // Normalise casing so a prefix-derived domain (`t:Backend`) collapses
+      // into the same facet chip as a bare canonical label (`backend`).
+      if (v) { domain = v.toLowerCase(); consumed.add(label); }
     }
   }
 
@@ -171,6 +146,7 @@ function resolveDomainAndProject(labels, projectName, warnings, unmatchedLabels)
       const hit = labels.find((l) => l.trim().toLowerCase() === wanted);
       if (hit) {
         domain = wanted;
+        consumed.add(hit);
         break;
       }
     }
@@ -178,8 +154,8 @@ function resolveDomainAndProject(labels, projectName, warnings, unmatchedLabels)
 
   if (!domain) {
     for (const label of labels) {
+      if (consumed.has(label)) continue;
       const key = label.trim().toLowerCase();
-      if (key.includes(':')) continue;
       if (!domainLabels.includes(key)) unmatchedLabels.add(label);
     }
   }
@@ -416,7 +392,8 @@ function buildContinuedEntry(issue, weekMonday, myAccountId, warnings) {
  * come from src/lib/server/jira.js.
  */
 export function mapIssuesToEntries({
-  issues, transitionsByKey, commentsByKey, hierarchy, browseUrl, warnings, weekMonday, myAccountId
+  issues, transitionsByKey, commentsByKey, hierarchy, browseUrl, warnings, weekMonday, myAccountId,
+  fullHistory = false
 }) {
   const commentsByKeySafe = commentsByKey ?? new Map();
   const { kept, suppressed } = suppressParents(issues, commentsByKeySafe);
@@ -433,8 +410,7 @@ export function mapIssuesToEntries({
     const transitions = transitionsByKey.get(issue.key) ?? [];
     const comments = commentsByKeySafe.get(issue.key) ?? [];
 
-    const resolved = hierarchy.get(issue.key) ?? { epic: null, parentIssueType: null, parentLabels: [] };
-    const category = resolveCategory(issue, resolved.parentIssueType);
+    const resolved = hierarchy.get(issue.key) ?? { epic: null, parentIssueType: null, parentLabels: [], parentKey: null, parentSummary: null };
     const { domain, project } = resolveDomainProjectWithInheritance(issue, hierarchy, warnings, unmatchedLabels);
     const labels = (issue.fields.labels ?? []).join(',');
 
@@ -451,7 +427,9 @@ export function mapIssuesToEntries({
         const merged = mergeDay(issue, dayRec, priorForThisDay, warnings);
         if (merged) dayResults.push({ date: dayRec.date, ...merged });
       }
-    } else {
+    } else if (!fullHistory) {
+      // "Still active, no activity this window" only means something for a
+      // single-week sync — meaningless (and noisy) across years of backfill.
       const fb = buildContinuedEntry(issue, weekMonday, myAccountId, warnings);
       if (fb) dayResults.push(fb);
     }
@@ -468,7 +446,6 @@ export function mapIssuesToEntries({
         date: d.date,
         description: d.description,
         details: d.details ?? null,
-        category,
         status,
         source: 'jira',
         jira_key: issue.key,
@@ -478,6 +455,11 @@ export function mapIssuesToEntries({
         project,
         domain,
         labels,
+        issue_summary: issue.fields.summary ?? null,
+        parent_key: resolved.parentKey ?? null,
+        parent_summary: resolved.parentSummary ?? null,
+        parent_issue_type: resolved.parentIssueType ?? null,
+        parent_url: resolved.parentKey ? browseUrl(resolved.parentKey) : null,
         signal: d.signal
       });
     }

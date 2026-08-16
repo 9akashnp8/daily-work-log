@@ -123,6 +123,16 @@ export function buildJql(weekMonday) {
   return `(${scope}) AND (${clauses.join(' OR ')}) ORDER BY updated DESC`;
 }
 
+/**
+ * No date bounds at all — every issue ever matching the scope, regardless of
+ * when it last changed. Used only for the one-time historical backfill; a
+ * normal sync always goes through buildJql() instead.
+ */
+export function buildJqlAllHistory() {
+  const scope = env.JIRA_JQL_SCOPE || 'assignee = currentUser()';
+  return `(${scope}) ORDER BY updated DESC`;
+}
+
 // `status` (nests statusCategory.key) and `assignee` (carries accountId) are
 // both required by the silent-ticket fallback in jiraMapping.js — keep them
 // even if they look unused from this file alone.
@@ -165,6 +175,13 @@ export async function searchWeekIssues(weekMonday, warnings = []) {
   return { jql, issues };
 }
 
+/** Fetch every issue matching the JQL scope, regardless of when it last changed. */
+export async function searchAllIssues(warnings = []) {
+  const jql = buildJqlAllHistory();
+  const issues = await searchIssues(jql, searchFields(), warnings);
+  return { jql, issues };
+}
+
 /** Batch-resolve a set of issue keys (used to look up sub-task parents / epics). */
 export async function searchByKeys(keys, warnings = []) {
   if (!keys.length) return [];
@@ -189,7 +206,7 @@ function isSubtaskIssue(issue) {
  * only one level deep, so a sub-task's parent is its Story, not the Epic —
  * resolving a sub-task's epic requires one extra batched lookup of its
  * parent story. Returns a Map keyed by issue key:
- *   { epic, parentIssueType, parentLabels }
+ *   { epic, parentIssueType, parentLabels, parentKey, parentSummary }
  */
 export async function resolveHierarchy(issues, warnings = []) {
   const subtaskParentKeys = new Set();
@@ -236,25 +253,30 @@ function resolveOne(issue, parentByKey) {
   const level = fields.issuetype?.hierarchyLevel;
 
   if (level === 1) {
-    return { epic: fields.summary, parentIssueType: null, parentLabels: [] };
+    return { epic: fields.summary, parentIssueType: null, parentLabels: [], parentKey: null, parentSummary: null };
   }
 
   if (isSubtaskIssue(issue) && fields.parent?.key) {
+    // The embedded `parent` field always ships {key, fields:{summary,status,
+    // priority,issuetype}} at zero extra API cost — parentKey/parentSummary
+    // come from here (or the batched parentFull lookup) for free, no new fetch.
     const parentLight = fields.parent;
     const parentFull = parentByKey.get(parentLight.key);
     const parentIssueType = parentFull?.fields?.issuetype?.name ?? parentLight.fields?.issuetype?.name ?? null;
     const parentLabels = parentFull?.fields?.labels ?? [];
     const grandparent = parentFull?.fields?.parent ?? null;
     const epic = grandparent?.fields?.summary ?? null;
-    return { epic, parentIssueType, parentLabels };
+    const parentKey = parentLight.key;
+    const parentSummary = parentFull?.fields?.summary ?? parentLight.fields?.summary ?? null;
+    return { epic, parentIssueType, parentLabels, parentKey, parentSummary };
   }
 
   // Story/Task level — an embedded `parent` (if present) is the epic itself.
   if (fields.parent?.fields?.summary && fields.parent?.fields?.issuetype?.hierarchyLevel !== -1) {
-    return { epic: fields.parent.fields.summary, parentIssueType: null, parentLabels: [] };
+    return { epic: fields.parent.fields.summary, parentIssueType: null, parentLabels: [], parentKey: null, parentSummary: null };
   }
 
-  return { epic: null, parentIssueType: null, parentLabels: [] };
+  return { epic: null, parentIssueType: null, parentLabels: [], parentKey: null, parentSummary: null };
 }
 
 async function fetchChangelogPage(issueKey, startAt) {
@@ -271,7 +293,7 @@ async function fetchChangelogPage(issueKey, startAt) {
  * timezone offset, which we don't know in advance, so date-only comparison
  * sidesteps any offset mismatch while still filing work on the correct day.
  */
-export async function fetchStatusTransitions(issueKey, fromDate, toDate) {
+export async function fetchStatusTransitions(issueKey, fromDate, toDate, { fullWalk = false } = {}) {
   const first = await fetchChangelogPage(issueKey, 0);
   let values = first.values ?? [];
   const total = first.total ?? values.length;
@@ -279,11 +301,14 @@ export async function fetchStatusTransitions(issueKey, fromDate, toDate) {
   if (total > 100) {
     // Walk backward from the tail until the oldest entry we hold is at or
     // before the window start, so no in-window transition is missed.
+    // `fullWalk` (the one-time full-history backfill) removes the hop cap —
+    // a bounded week-sync would otherwise silently miss a transition on a
+    // very long-lived, high-churn issue.
     let startAt = Math.max(0, total - 100);
     let page = await fetchChangelogPage(issueKey, startAt);
     values = page.values ?? [];
     let hops = 0;
-    while (startAt > 0 && values.length && values[0].created.slice(0, 10) > fromDate && hops < 3) {
+    while (startAt > 0 && values.length && values[0].created.slice(0, 10) > fromDate && (fullWalk || hops < 3)) {
       startAt = Math.max(0, startAt - 100);
       page = await fetchChangelogPage(issueKey, startAt);
       values = [...(page.values ?? []), ...values];
@@ -323,12 +348,12 @@ export async function fetchStatusTransitions(issueKey, fromDate, toDate) {
 }
 
 /** Fetch changelog transitions for many issues, BATCH_SIZE at a time. */
-export async function fetchTransitionsForIssues(issueKeys, fromDate, toDate) {
+export async function fetchTransitionsForIssues(issueKeys, fromDate, toDate, { fullWalk = false } = {}) {
   const byKey = new Map();
   for (let i = 0; i < issueKeys.length; i += BATCH_SIZE) {
     const batch = issueKeys.slice(i, i + BATCH_SIZE);
     const results = await Promise.all(
-      batch.map((key) => fetchStatusTransitions(key, fromDate, toDate))
+      batch.map((key) => fetchStatusTransitions(key, fromDate, toDate, { fullWalk }))
     );
     batch.forEach((key, idx) => byKey.set(key, results[idx]));
   }

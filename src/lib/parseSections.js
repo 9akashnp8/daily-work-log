@@ -1,3 +1,23 @@
+/**
+ * Convert inline markdown to safe HTML for use with {@html}.
+ * Handles: **bold**, *italic*, `code`, and escapes HTML entities.
+ */
+export function renderInline(text) {
+  return text
+    // Escape HTML entities first to prevent injection
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    // Bold: **text** or __text__
+    .replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>')
+    .replace(/__(.+?)__/g, '<strong>$1</strong>')
+    // Italic: *text* or _text_ (not already consumed by bold)
+    .replace(/\*([^*]+?)\*/g, '<em>$1</em>')
+    .replace(/_([^_]+?)_/g, '<em>$1</em>')
+    // Inline code: `code`
+    .replace(/`([^`]+?)`/g, '<code>$1</code>');
+}
+
 const SECTION_KEYS = [
   'Updates in Detail',
   'Plan for Next Week',

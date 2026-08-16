@@ -1,15 +1,13 @@
 <script>
   import { browser } from '$app/environment';
-  import { store, CATEGORIES, STATUSES, distinctValues } from '$lib/store.svelte.js';
+  import { store, STATUSES } from '$lib/store.svelte.js';
+  import { buildDraftMarkdown } from '$lib/buildDraft.js';
+  import { renderMarkdown } from '$lib/renderMarkdown.js';
 
   // ─── Helpers ─────────────────────────────────────────────────────────────
 
   function toDateStr(d) {
     return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
-  }
-
-  function todayStr() {
-    return toDateStr(new Date());
   }
 
   function getWeekDays(offset) {
@@ -34,24 +32,14 @@
     return `${fmt(days[0])} – ${fmt(days[6])}`;
   }
 
-  function formatDayLabel(dateStr) {
-    const d = new Date(dateStr + 'T00:00:00');
-    const label = d.toLocaleDateString('en-GB', { weekday: 'long', day: 'numeric', month: 'short' });
-    return dateStr === todayStr() ? `${label} — Today` : label;
-  }
-
+  // Still needed by the sync-preview modal's status badges below.
   function statusLabel(val) {
     return STATUSES.find(s => s.value === val)?.label ?? val;
   }
 
   // ─── State ────────────────────────────────────────────────────────────────
 
-  let weekOffset   = $state(0);
-  let formDate     = $state(todayStr());
-  let formDesc     = $state('');
-  let formCategory = $state(CATEGORIES[0]);
-  let formStatus   = $state(STATUSES[0].value);
-  let activeTab    = $state('week'); // 'form' | 'week'
+  let weekOffset = $state(0);
 
   // Dark mode
   let dark = $state(browser ? localStorage.getItem('theme') === 'dark' : false);
@@ -61,151 +49,81 @@
     localStorage.setItem('theme', dark ? 'dark' : 'light');
   });
 
-  // Edit state
-  let editingId  = $state(null);
-  let editDesc   = $state('');
-  let editCat    = $state('');
-  let editStatus = $state('');
-
   const weekDays  = $derived(getWeekDays(weekOffset));
   const weekLabel = $derived(formatWeekLabel(weekDays));
-
-  // Load entries whenever the week changes
-  $effect(() => {
-    store.loadWeek(weekDays[0]);
-  });
 
   // Check once whether Jira sync is configured server-side
   $effect(() => {
     store.checkSyncEnabled();
   });
 
-  // ─── Epic / project / domain filters ───────────────────────────────────────
-
-  let filter = $state({ epic: null, project: null, domain: null });
-
-  const facets = $derived({
-    epic:    distinctValues(store.entries, 'epic'),
-    project: distinctValues(store.entries, 'project'),
-    domain:  distinctValues(store.entries, 'domain')
-  });
-
-  const filteredEntries = $derived(
-    store.entries.filter(e =>
-      (!filter.epic    || e.epic    === filter.epic) &&
-      (!filter.project || e.project === filter.project) &&
-      (!filter.domain  || e.domain  === filter.domain)
-    )
-  );
-
-  function toggleFilter(dim, value) {
-    filter[dim] = filter[dim] === value ? null : value;
-  }
-
-  function entriesForDay(day) {
-    return filteredEntries.filter(e => e.date === day);
-  }
-
   function handleGlobalKeydown(e) {
     if (e.key === 'Escape' && store.syncPreview) store.cancelSync();
   }
 
-  const statusCounts = $derived(
-    STATUSES.map(s => ({
-      ...s,
-      count: weekDays.flatMap(d => entriesForDay(d)).filter(e => e.status === s.value).length
-    }))
-  );
+  // ─── Draft + AI Summary ─────────────────────────────────────────────────
 
-  // ─── Add entry ────────────────────────────────────────────────────────────
+  let draft         = $state('');
+  let draftMode     = $state('preview'); // 'preview' | 'edit' — resets on week change
+  let summarizing    = $state(false);
+  let summary        = $state('');
+  let summaryError   = $state('');
+  let copied         = $state(false);
 
-  async function addEntry() {
-    const lines = formDesc.split('\n').map(l => l.trim()).filter(Boolean);
-    if (!lines.length) return;
-    const adds = lines.map((line, i) => ({
-      id: `${Date.now()}-${i}-${Math.random().toString(36).slice(2, 7)}`,
-      date: formDate,
-      description: line,
-      category: formCategory,
-      status: formStatus
-    }));
-    formDesc = '';
-    for (const entry of adds) {
-      await store.add(entry);
-    }
-    // Switch to week view on mobile after adding
-    if (browser && window.matchMedia('(max-width: 800px)').matches) {
-      activeTab = 'week';
-    }
-  }
-
-  function handleKeydown(e) {
-    if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); addEntry(); }
-  }
-
-  // ─── Edit entry ───────────────────────────────────────────────────────────
-
-  function startEdit(entry) {
-    editingId  = entry.id;
-    editDesc   = entry.description;
-    editCat    = entry.category;
-    editStatus = entry.status;
-  }
-
-  function saveEdit() {
-    if (!editDesc.trim() || !editingId) return;
-    store.update(editingId, { description: editDesc.trim(), category: editCat, status: editStatus });
-    editingId = null;
-  }
-
-  function cancelEdit() { editingId = null; }
-
-  function handleEditKeydown(e) {
-    if (e.key === 'Enter')  { e.preventDefault(); saveEdit(); }
-    if (e.key === 'Escape') { cancelEdit(); }
-  }
-
-  // ─── AI Summary ───────────────────────────────────────────────────────────
-
-  let summarizing  = $state(false);
-  let summary      = $state('');
-  let summaryError = $state('');
-  let copied       = $state(false);
-
-  const weekEntries = $derived(weekDays.flatMap(d => entriesForDay(d)));
-
-  // Load saved report whenever the week changes
+  // Load this week's entries + saved draft/summary together, then decide the
+  // draft's initial content — auto-generate from entries only when nothing
+  // is saved for this week yet, so a persisted draft always wins over
+  // regeneration. The staleness guard avoids a stale write if the week is
+  // changed again before this resolves.
   $effect(() => {
     const week = weekDays[0];
-    summary = '';
-    summaryError = '';
-    fetch(`/api/reports?week=${week}`)
-      .then(r => r.json())
-      .then(d => { if (d.summary) summary = d.summary; })
-      .catch(() => {});
+    const label = weekLabel;
+    summary = ''; summaryError = ''; draft = ''; draftMode = 'preview';
+    (async () => {
+      const [, reportData] = await Promise.all([
+        store.loadWeek(week),
+        fetch(`/api/reports?week=${week}`).then(r => r.json())
+      ]);
+      if (week !== weekDays[0]) return;
+      summary = reportData.summary ?? '';
+      draft = reportData.draft || buildDraftMarkdown(store.entries, label);
+    })();
   });
 
-  async function persistReport(week, text) {
+  async function persistReport(week, partial) {
     await fetch('/api/reports', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ week, summary: text })
+      body: JSON.stringify({ week, ...partial })
     });
   }
 
+  // Draft editing is heavier than summary editing (freeform notes, not just
+  // occasional tweaks) — debounce instead of saving on every keystroke.
+  let draftSaveTimer;
+  function onDraftInput() {
+    clearTimeout(draftSaveTimer);
+    draftSaveTimer = setTimeout(() => persistReport(weekDays[0], { draft }), 400);
+  }
+
+  function regenerateFromJira() {
+    draft = buildDraftMarkdown(store.entries, weekLabel);
+    persistReport(weekDays[0], { draft });
+  }
+
   async function generateSummary() {
-    summarizing = true; summaryError = ''; summary = '';
+    summarizing = true; summaryError = '';
     const week = weekDays[0];
     try {
       const res = await fetch('/api/summarize', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ entries: weekEntries, weekLabel })
+        body: JSON.stringify({ draft, weekLabel })
       });
       const data = await res.json();
       if (!res.ok) throw new Error(data.message ?? 'Request failed');
       summary = data.summary;
-      await persistReport(week, summary);
+      await persistReport(week, { summary });
     } catch (e) {
       summaryError = e.message;
     } finally {
@@ -218,7 +136,6 @@
     copied = true;
     setTimeout(() => { copied = false; }, 2000);
   }
-
 </script>
 
 <svelte:window onkeydown={handleGlobalKeydown} />
@@ -231,343 +148,192 @@
     </button>
   </header>
 
-  <!-- Mobile tab bar -->
-  <div class="mobile-tabs">
-    <button class:active={activeTab === 'form'} onclick={() => activeTab = 'form'}>
-      Add Entry
-    </button>
-    <button class:active={activeTab === 'week'} onclick={() => activeTab = 'week'}>
-      This Week
-    </button>
-  </div>
+  <section class="week-panel">
+    <div class="week-nav">
+      <button onclick={() => weekOffset--}>&#8592;</button>
+      <span class="week-label">{weekLabel}</span>
+      <button onclick={() => weekOffset++}>&#8594;</button>
+    </div>
 
-  <div class="layout">
-
-    <!-- ── Add Entry Form ──────────────────────────────────────────── -->
-    <aside class="form-panel" class:hidden-mobile={activeTab !== 'form'}>
-      <form onsubmit={(e) => { e.preventDefault(); addEntry(); }}>
-        <h2>Log Entry</h2>
-
-        <div class="field">
-          <label for="date">Date</label>
-          <input id="date" type="date" bind:value={formDate} />
-        </div>
-
-        <div class="field">
-          <label for="desc">Task <span class="hint">Shift+Enter for multiple</span></label>
-          <textarea
-            id="desc"
-            placeholder="What did you work on?"
-            bind:value={formDesc}
-            onkeydown={handleKeydown}
-            autocomplete="off"
-            rows="3"
-          ></textarea>
-        </div>
-
-        <div class="field">
-          <label for="cat">Category</label>
-          <select id="cat" bind:value={formCategory}>
-            {#each CATEGORIES as cat}
-              <option value={cat}>{cat}</option>
-            {/each}
-          </select>
-        </div>
-
-        <div class="field">
-          <label for="status">Status</label>
-          <select id="status" bind:value={formStatus}>
-            {#each STATUSES as s}
-              <option value={s.value}>{s.label}</option>
-            {/each}
-          </select>
-        </div>
-
-        <button type="submit">Add Entry</button>
-      </form>
-
-      <div class="mapping-ref">
-        <h3>Status → Weekly Deck</h3>
-        <div class="mapping-rows">
-          <div class="mapping-row">
-            <span class="badge status-done">Done</span>
-            <span>Updates in Detail</span>
-          </div>
-          <div class="mapping-row">
-            <span class="badge status-in-progress">In Progress</span>
-            <span>Updates in Detail</span>
-          </div>
-          <div class="mapping-row">
-            <span class="badge status-next-week">Next Week</span>
-            <span>Action Items / Plan</span>
-          </div>
-          <div class="mapping-row">
-            <span class="badge status-blocker">Blocker</span>
-            <span>Challenges &amp; Issues</span>
-          </div>
-          <div class="mapping-row">
-            <span class="badge status-achievement">Achievement</span>
-            <span>Achievements</span>
-          </div>
-        </div>
-      </div>
-    </aside>
-
-    <!-- ── Weekly View ─────────────────────────────────────────────── -->
-    <section class="week-panel" class:hidden-mobile={activeTab !== 'week'}>
-      <div class="week-nav">
-        <button onclick={() => weekOffset--}>&#8592;</button>
-        <span class="week-label">{weekLabel}</span>
-        <button onclick={() => weekOffset++}>&#8594;</button>
-      </div>
-
-      {#if store.syncEnabled}
-        <div class="sync-bar">
-          <button class="sync-btn" onclick={() => store.previewSync(weekDays[0])} disabled={store.syncing}>
-            {#if store.syncing && !store.syncPreview}
-              <span class="spinner sync-spinner"></span> Checking Jira…
-            {:else}
-              ⟳ Sync from Jira
-            {/if}
-          </button>
-          {#if store.syncError}
-            <span class="sync-error">⚠ {store.syncError}</span>
+    {#if store.syncEnabled}
+      <div class="sync-bar">
+        <button class="sync-btn" onclick={() => store.previewSync(weekDays[0])} disabled={store.syncing}>
+          {#if store.syncing && !store.syncPreview}
+            <span class="spinner sync-spinner"></span> Checking Jira…
+          {:else}
+            ⟳ Sync from Jira
           {/if}
+        </button>
+        {#if store.syncError}
+          <span class="sync-error">⚠ {store.syncError}</span>
+        {/if}
+      </div>
+    {/if}
+
+    {#if store.syncPreview}
+      {@const p = store.syncPreview}
+      {@const totalChanges = p.stats.new + p.stats.update + p.stats.remove}
+      <div class="sync-overlay">
+        <div class="sync-card">
+          <div class="sync-card-header">
+            <h2 class="sync-title">Sync preview — {weekLabel}</h2>
+            <button class="icon-btn cancel-btn" onclick={() => store.cancelSync()} aria-label="Close">✕</button>
+          </div>
+
+          <div class="sync-stats">
+            <span class="sync-stat sync-stat-new">{p.stats.new} new</span>
+            <span class="sync-stat sync-stat-update">{p.stats.update} updated</span>
+            <span class="sync-stat sync-stat-skip">{p.stats.skip} kept (edited)</span>
+            <span class="sync-stat sync-stat-remove">{p.stats.remove} removed</span>
+            {#if p.stats.comments}
+              <span class="sync-stat sync-stat-comment">{p.stats.comments} from comments</span>
+            {/if}
+            {#if p.stats.continued}
+              <span class="sync-stat sync-stat-continued">{p.stats.continued} continued</span>
+            {/if}
+          </div>
+
+          {#if p.warnings?.length}
+            <ul class="sync-warnings">
+              {#each p.warnings as w}<li>{w}</li>{/each}
+            </ul>
+          {/if}
+
+          <div class="sync-entries">
+            {#each p.entries as e}
+              <div class="sync-entry-row sync-action-{e.action}">
+                <span class="sync-marker">{e.action === 'new' ? '+' : e.action === 'update' ? '~' : '='}</span>
+                <span
+                  class="sync-signal sync-signal-{e.signal}"
+                  title={e.signal === 'comment' ? 'From your Jira comments' : e.signal === 'flagged' ? 'Flagged' : e.signal === 'continued' ? 'No activity this week — still active' : 'From a status change'}
+                >{e.signal === 'comment' ? '💬' : e.signal === 'flagged' ? '⚑' : e.signal === 'continued' ? '⋯' : '→'}</span>
+                <span class="sync-date">{e.date}</span>
+                <a class="jira-chip" href={e.jira_url} target="_blank" rel="noopener noreferrer">{e.jira_key}</a>
+                <span class="sync-desc" title={e.details || e.description}>{e.description}</span>
+                <span class="badge status-{e.status}">{statusLabel(e.status)}</span>
+              </div>
+            {/each}
+            {#each p.removing as r}
+              <div class="sync-entry-row sync-action-remove">
+                <span class="sync-marker">−</span>
+                <span class="sync-date">{r.date}</span>
+                <span class="jira-chip">{r.jira_key}</span>
+                <span class="sync-desc sync-desc-removed">{r.description}</span>
+              </div>
+            {/each}
+            {#if p.entries.length === 0 && p.removing.length === 0}
+              <p class="sync-empty">No Jira activity found for this week.</p>
+            {/if}
+          </div>
+
+          <details class="sync-jql">
+            <summary>Raw JQL</summary>
+            <code>{p.jql}</code>
+          </details>
+
+          <div class="sync-card-footer">
+            <button class="sync-cancel-btn" onclick={() => store.cancelSync()}>Cancel</button>
+            <button
+              class="sync-apply-btn"
+              onclick={() => store.applySync(weekDays[0])}
+              disabled={store.syncing || totalChanges === 0}
+            >
+              {#if store.syncing}
+                <span class="spinner"></span> Applying…
+              {:else}
+                Apply {totalChanges} change{totalChanges === 1 ? '' : 's'}
+              {/if}
+            </button>
+          </div>
+        </div>
+      </div>
+    {/if}
+
+    {#if store.loading}
+      <div class="loading-bar">Loading…</div>
+    {/if}
+
+    {#if store.error}
+      <p class="store-error">⚠ {store.error}</p>
+    {/if}
+
+    <!-- ── Weekly Notes (draft) ───────────────────────────────────────── -->
+    <div class="draft-section">
+      <div class="draft-toolbar">
+        <span class="draft-label">Weekly Notes</span>
+        <div class="draft-toolbar-actions">
+          <div class="mode-toggle">
+            <button class:active={draftMode === 'preview'} onclick={() => draftMode = 'preview'}>Preview</button>
+            <button class:active={draftMode === 'edit'} onclick={() => draftMode = 'edit'}>Edit</button>
+          </div>
+          <button
+            class="regen-btn"
+            onclick={regenerateFromJira}
+            disabled={store.entries.length === 0}
+            title="Rebuild from current Jira data — overwrites this text"
+          >
+            ↺ Regenerate from Jira
+          </button>
+        </div>
+      </div>
+      {#if draftMode === 'edit'}
+        <textarea
+          class="draft-text"
+          bind:value={draft}
+          oninput={onDraftInput}
+          spellcheck="false"
+        ></textarea>
+      {:else}
+        <!-- svelte-ignore a11y_click_events_have_key_events, a11y_no_static_element_interactions -->
+        <div class="draft-preview" onclick={() => draftMode = 'edit'} title="Click to edit">
+          {@html renderMarkdown(draft)}
         </div>
       {/if}
+    </div>
 
-      {#if store.syncPreview}
-        {@const p = store.syncPreview}
-        {@const totalChanges = p.stats.new + p.stats.update + p.stats.remove}
-        <div class="sync-overlay">
-          <div class="sync-card">
-            <div class="sync-card-header">
-              <h2 class="sync-title">Sync preview — {weekLabel}</h2>
-              <button class="icon-btn cancel-btn" onclick={() => store.cancelSync()} aria-label="Close">✕</button>
-            </div>
+    <!-- ── AI Summary ─────────────────────────────────────────────── -->
+    <div class="ai-section">
+      <button
+        class="summarize-btn"
+        onclick={generateSummary}
+        disabled={summarizing || !draft.trim()}
+      >
+        {#if summarizing}
+          <span class="spinner"></span> Generating…
+        {:else if summary}
+          ↺ Regenerate Summary
+        {:else}
+          ✨ Generate Summary
+        {/if}
+      </button>
 
-            <div class="sync-stats">
-              <span class="sync-stat sync-stat-new">{p.stats.new} new</span>
-              <span class="sync-stat sync-stat-update">{p.stats.update} updated</span>
-              <span class="sync-stat sync-stat-skip">{p.stats.skip} kept (edited)</span>
-              <span class="sync-stat sync-stat-remove">{p.stats.remove} removed</span>
-              {#if p.stats.comments}
-                <span class="sync-stat sync-stat-comment">{p.stats.comments} from comments</span>
-              {/if}
-              {#if p.stats.continued}
-                <span class="sync-stat sync-stat-continued">{p.stats.continued} continued</span>
-              {/if}
-            </div>
+      {#if summaryError}
+        <p class="summary-error">⚠ {summaryError}</p>
+      {/if}
 
-            {#if p.warnings?.length}
-              <ul class="sync-warnings">
-                {#each p.warnings as w}<li>{w}</li>{/each}
-              </ul>
-            {/if}
-
-            <div class="sync-entries">
-              {#each p.entries as e}
-                <div class="sync-entry-row sync-action-{e.action}">
-                  <span class="sync-marker">{e.action === 'new' ? '+' : e.action === 'update' ? '~' : '='}</span>
-                  <span
-                    class="sync-signal sync-signal-{e.signal}"
-                    title={e.signal === 'comment' ? 'From your Jira comments' : e.signal === 'flagged' ? 'Flagged' : e.signal === 'continued' ? 'No activity this week — still active' : 'From a status change'}
-                  >{e.signal === 'comment' ? '💬' : e.signal === 'flagged' ? '⚑' : e.signal === 'continued' ? '⋯' : '→'}</span>
-                  <span class="sync-date">{e.date}</span>
-                  <a class="jira-chip" href={e.jira_url} target="_blank" rel="noopener noreferrer">{e.jira_key}</a>
-                  <span class="sync-desc" title={e.details || e.description}>{e.description}</span>
-                  <span class="badge status-{e.status}">{statusLabel(e.status)}</span>
-                </div>
-              {/each}
-              {#each p.removing as r}
-                <div class="sync-entry-row sync-action-remove">
-                  <span class="sync-marker">−</span>
-                  <span class="sync-date">{r.date}</span>
-                  <span class="jira-chip">{r.jira_key}</span>
-                  <span class="sync-desc sync-desc-removed">{r.description}</span>
-                </div>
-              {/each}
-              {#if p.entries.length === 0 && p.removing.length === 0}
-                <p class="sync-empty">No Jira activity found for this week.</p>
-              {/if}
-            </div>
-
-            <details class="sync-jql">
-              <summary>Raw JQL</summary>
-              <code>{p.jql}</code>
-            </details>
-
-            <div class="sync-card-footer">
-              <button class="sync-cancel-btn" onclick={() => store.cancelSync()}>Cancel</button>
-              <button
-                class="sync-apply-btn"
-                onclick={() => store.applySync(weekDays[0])}
-                disabled={store.syncing || totalChanges === 0}
-              >
-                {#if store.syncing}
-                  <span class="spinner"></span> Applying…
-                {:else}
-                  Apply {totalChanges} change{totalChanges === 1 ? '' : 's'}
-                {/if}
+      {#if summary}
+        <div class="summary-output">
+          <div class="summary-toolbar">
+            <span class="summary-label">AI Summary</span>
+            <div class="summary-actions">
+              <button class="copy-btn" onclick={copyToClipboard}>
+                {copied ? '✓ Copied!' : 'Copy'}
+              </button>
+              <button class="copy-btn export-btn" onclick={() => window.open(`/print?week=${weekDays[0]}`, '_blank')}>
+                ↗ Open as Slide
               </button>
             </div>
           </div>
+          <textarea
+            class="summary-text"
+            bind:value={summary}
+            oninput={() => persistReport(weekDays[0], { summary })}
+            spellcheck="false"
+          ></textarea>
         </div>
       {/if}
-
-      {#if facets.epic.length > 1 || facets.project.length > 1 || facets.domain.length > 1}
-        <div class="facets">
-          {#each [['epic', facets.epic], ['project', facets.project], ['domain', facets.domain]] as [dim, values]}
-            {#if values.length > 1}
-              <div class="facet-row">
-                <span class="facet-label">{dim}</span>
-                {#each values as v}
-                  <button class="facet-chip" class:active={filter[dim] === v} onclick={() => toggleFilter(dim, v)}>{v}</button>
-                {/each}
-              </div>
-            {/if}
-          {/each}
-        </div>
-      {/if}
-
-      {#if store.loading}
-        <div class="loading-bar">Loading…</div>
-      {/if}
-
-      {#if store.error}
-        <p class="store-error">⚠ {store.error}</p>
-      {/if}
-
-      <div class="days">
-        {#each weekDays as day}
-          {@const dayEntries = entriesForDay(day)}
-          {@const isToday = day === todayStr()}
-          <div class="day" class:is-today={isToday} class:is-empty={dayEntries.length === 0}>
-            <div class="day-header">
-              <span class="day-name">{formatDayLabel(day)}</span>
-              {#if dayEntries.length > 0}
-                <span class="day-count">{dayEntries.length}</span>
-              {/if}
-            </div>
-
-            {#if dayEntries.length > 0}
-              <ul class="entries">
-                {#each dayEntries as entry (entry.id)}
-                  <li
-                    class="entry"
-                    class:is-editing={editingId === entry.id}
-                    class:is-synced={entry.source === 'jira'}
-                    class:has-note={Boolean(entry.details)}
-                  >
-                    {#if editingId === entry.id}
-                      <div class="edit-row">
-                        <input
-                          class="edit-desc"
-                          type="text"
-                          bind:value={editDesc}
-                          onkeydown={handleEditKeydown}
-                        />
-                        <select class="edit-select" bind:value={editCat}>
-                          {#each CATEGORIES as cat}
-                            <option value={cat}>{cat}</option>
-                          {/each}
-                        </select>
-                        <select class="edit-select" bind:value={editStatus}>
-                          {#each STATUSES as s}
-                            <option value={s.value}>{s.label}</option>
-                          {/each}
-                        </select>
-                        <button class="icon-btn confirm-btn" onclick={saveEdit} title="Save (Enter)">✓</button>
-                        <button class="icon-btn cancel-btn" onclick={cancelEdit} title="Cancel (Esc)">✕</button>
-                      </div>
-                    {:else}
-                      {#if entry.jira_key}
-                        <a
-                          class="jira-chip"
-                          href={entry.jira_url}
-                          target="_blank"
-                          rel="noopener noreferrer"
-                          onclick={(e) => e.stopPropagation()}
-                        >{entry.jira_key}</a>
-                      {/if}
-                      <span class="desc" title={entry.details || entry.description}>{entry.description}</span>
-                      <div class="entry-badges">
-                        {#if entry.epic}
-                          <span class="badge epic-badge" title={entry.epic}>{entry.epic}</span>
-                        {/if}
-                        {#if entry.domain}
-                          <span class="badge domain-badge">{entry.domain}</span>
-                        {/if}
-                        <span class="badge cat-badge">{entry.category}</span>
-                        <span class="badge status-{entry.status}">{statusLabel(entry.status)}</span>
-                      </div>
-                      <button class="edit-btn" onclick={() => startEdit(entry)} aria-label="Edit" title="Edit">✎</button>
-                      <button class="del-btn"  onclick={() => store.delete(entry.id)} aria-label="Delete" title="Delete">×</button>
-                    {/if}
-                  </li>
-                {/each}
-              </ul>
-            {:else}
-              <p class="empty-day">No entries</p>
-            {/if}
-          </div>
-        {/each}
-      </div>
-
-      <div class="week-summary">
-        {#each statusCounts as s}
-          <div class="summary-chip">
-            <span class="badge status-{s.value}">{s.label}</span>
-            <strong>{s.count}</strong>
-          </div>
-        {/each}
-      </div>
-
-      <!-- ── AI Summary ─────────────────────────────────────────────── -->
-      <div class="ai-section">
-        <button
-          class="summarize-btn"
-          onclick={generateSummary}
-          disabled={summarizing || weekEntries.length === 0}
-        >
-          {#if summarizing}
-            <span class="spinner"></span> Generating…
-          {:else if summary}
-            ↺ Regenerate Summary
-          {:else}
-            ✨ Generate Summary
-          {/if}
-        </button>
-
-        {#if summaryError}
-          <p class="summary-error">⚠ {summaryError}</p>
-        {/if}
-
-        {#if summary}
-          <div class="summary-output">
-            <div class="summary-toolbar">
-              <span class="summary-label">AI Summary</span>
-              <div class="summary-actions">
-                <button class="copy-btn" onclick={copyToClipboard}>
-                  {copied ? '✓ Copied!' : 'Copy'}
-                </button>
-                <button class="copy-btn export-btn" onclick={() => window.open(`/print?week=${weekDays[0]}`, '_blank')}>
-                  ↗ Open as Slide
-                </button>
-              </div>
-            </div>
-            <textarea
-              class="summary-text"
-              bind:value={summary}
-              oninput={() => persistReport(weekDays[0], summary)}
-              spellcheck="false"
-            ></textarea>
-          </div>
-        {/if}
-      </div>
-    </section>
-
-  </div>
+    </div>
+  </section>
 </main>
 
 <style>
@@ -661,34 +427,7 @@
   }
   .theme-btn:hover { background: var(--nav-hover); border-color: var(--text-faint); }
 
-  /* ── Mobile tab bar ────────────────────────────────────────────────── */
-  .mobile-tabs {
-    display: none;
-  }
-
-  /* ── Layout grid ───────────────────────────────────────────────────── */
-  .layout {
-    display: grid;
-    grid-template-columns: 300px 1fr;
-    gap: 1.5rem;
-    padding: 1.5rem 2rem;
-    max-width: 1280px;
-    margin: 0 auto;
-  }
-
-  /* ── Form panel ────────────────────────────────────────────────────── */
-  .form-panel { display: flex; flex-direction: column; gap: 1rem; }
-
-  form {
-    background: var(--surface);
-    border: 1px solid var(--border);
-    border-radius: 0.625rem;
-    padding: 1.25rem;
-    display: flex;
-    flex-direction: column;
-    gap: 0.875rem;
-  }
-
+  /* Bare h2 also styles .sync-title in the sync preview modal below. */
   h2 {
     font-size: 0.8125rem;
     font-weight: 700;
@@ -698,93 +437,15 @@
     margin-bottom: 0.125rem;
   }
 
-  .field { display: flex; flex-direction: column; gap: 0.3rem; }
-
-  label {
-    font-size: 0.7rem;
-    font-weight: 600;
-    text-transform: uppercase;
-    letter-spacing: 0.05em;
-    color: var(--text-faint);
-    display: flex;
-    align-items: baseline;
-    gap: 0.4rem;
-  }
-
-  .hint {
-    font-size: 0.65rem;
-    font-weight: 400;
-    text-transform: none;
-    letter-spacing: 0;
-    color: var(--text-hint);
-  }
-
-  textarea,
-  input[type='text'],
-  input[type='date'],
-  select {
-    padding: 0.5rem 0.625rem;
-    border: 1px solid var(--border);
-    border-radius: 0.4rem;
-    font-size: 0.875rem;
-    color: var(--text);
-    background: var(--input-bg);
-    width: 100%;
-    transition: border-color 0.15s, box-shadow 0.15s;
-  }
-
-  textarea { resize: vertical; min-height: 4rem; }
-
-  input:focus, select:focus, textarea:focus {
-    outline: none;
-    border-color: #3b82f6;
-    box-shadow: 0 0 0 3px rgba(59, 130, 246, 0.15);
-  }
-
-  button[type='submit'] {
-    margin-top: 0.25rem;
-    padding: 0.625rem;
-    background: #2563eb;
-    color: #fff;
-    border: none;
-    border-radius: 0.4rem;
-    font-size: 0.875rem;
-    font-weight: 600;
-    cursor: pointer;
-    transition: background 0.15s;
-  }
-  button[type='submit']:hover  { background: #1d4ed8; }
-  button[type='submit']:active { background: #1e40af; }
-
-  /* ── Mapping reference ─────────────────────────────────────────────── */
-  .mapping-ref {
-    background: var(--surface);
-    border: 1px solid var(--border);
-    border-radius: 0.625rem;
-    padding: 1rem 1.25rem;
-  }
-
-  h3 {
-    font-size: 0.7rem;
-    font-weight: 700;
-    text-transform: uppercase;
-    letter-spacing: 0.06em;
-    color: var(--text-faint);
-    margin-bottom: 0.625rem;
-  }
-
-  .mapping-rows { display: flex; flex-direction: column; gap: 0.4rem; }
-
-  .mapping-row {
-    display: flex;
-    align-items: center;
-    gap: 0.5rem;
-    font-size: 0.8rem;
-    color: var(--mapping-text);
-  }
-
   /* ── Week panel ────────────────────────────────────────────────────── */
-  .week-panel { display: flex; flex-direction: column; gap: 0.875rem; }
+  .week-panel {
+    display: flex;
+    flex-direction: column;
+    gap: 0.875rem;
+    max-width: 1280px;
+    margin: 0 auto;
+    padding: 1.5rem 2rem;
+  }
 
   .week-nav {
     display: flex;
@@ -821,25 +482,27 @@
     gap: 0.75rem;
   }
 
+  /* Primary action now that Jira is the main source of entries. */
   .sync-btn {
     display: flex;
     align-items: center;
     justify-content: center;
     gap: 0.4rem;
-    padding: 0.5rem 0.875rem;
-    background: var(--surface);
-    color: #2563eb;
-    border: 1px dashed #bfdbfe;
+    padding: 0.625rem 1.1rem;
+    background: #2563eb;
+    color: #ffffff;
+    border: 1px solid #2563eb;
     border-radius: 0.5rem;
-    font-size: 0.8125rem;
+    font-size: 0.875rem;
     font-weight: 600;
     cursor: pointer;
+    box-shadow: 0 1px 2px rgba(37, 99, 235, 0.25);
     transition: background 0.15s, border-color 0.15s;
   }
-  .sync-btn:hover:not(:disabled) { background: #eff6ff; border-color: #93c5fd; }
+  .sync-btn:hover:not(:disabled) { background: #1d4ed8; border-color: #1d4ed8; }
   .sync-btn:disabled { opacity: 0.6; cursor: not-allowed; }
 
-  .sync-spinner { border-color: #bfdbfe; border-top-color: #2563eb; }
+  .sync-spinner { border-color: rgba(255, 255, 255, 0.35); border-top-color: #ffffff; }
 
   .sync-error {
     font-size: 0.8125rem;
@@ -1011,59 +674,23 @@
   }
   a.jira-chip:hover { background: #dbeafe; }
 
-  .entry.is-synced { border-left: 2px solid #93c5fd; }
-  /* A comment-derived entry carries your own words — mark it distinctly
-     from a plain status-transition entry. */
-  .entry.has-note { border-left-color: #a78bfa; }
-
-  .epic-badge, .domain-badge {
-    background: var(--cat-bg);
-    color: var(--cat-text);
-    max-width: 12ch;
-    overflow: hidden;
-    text-overflow: ellipsis;
-  }
-
-  /* ── Filter chips ──────────────────────────────────────────────────── */
-  .facets {
-    display: flex;
-    flex-direction: column;
-    gap: 0.4rem;
-    background: var(--surface);
+  .icon-btn {
+    background: none;
     border: 1px solid var(--border);
-    border-radius: 0.625rem;
-    padding: 0.625rem 1rem;
-  }
-
-  .facet-row {
+    border-radius: 0.25rem;
+    width: 1.75rem;
+    height: 1.75rem;
+    cursor: pointer;
+    font-size: 0.75rem;
     display: flex;
     align-items: center;
-    flex-wrap: wrap;
-    gap: 0.375rem;
-  }
-
-  .facet-label {
-    font-size: 0.7rem;
-    font-weight: 700;
-    text-transform: uppercase;
-    letter-spacing: 0.05em;
-    color: var(--text-faint);
-    width: 4.5rem;
+    justify-content: center;
     flex-shrink: 0;
+    transition: background 0.15s, color 0.15s, border-color 0.15s;
   }
 
-  .facet-chip {
-    padding: 0.2rem 0.6rem;
-    border-radius: 9999px;
-    border: 1px solid var(--border);
-    background: none;
-    font-size: 0.75rem;
-    color: var(--text-muted);
-    cursor: pointer;
-    transition: background 0.15s, border-color 0.15s, color 0.15s;
-  }
-  .facet-chip:hover { background: var(--nav-hover); }
-  .facet-chip.active { background: #2563eb; border-color: #2563eb; color: #fff; }
+  .cancel-btn  { color: var(--text-faint); }
+  .cancel-btn:hover  { color: #dc2626; background: #fee2e2; border-color: #fca5a5; }
 
   /* ── Loading / error ───────────────────────────────────────────────── */
   .loading-bar {
@@ -1085,163 +712,6 @@
     padding: 0.5rem 0.75rem;
   }
 
-  /* ── Days ──────────────────────────────────────────────────────────── */
-  .days { display: flex; flex-direction: column; gap: 0.5rem; }
-
-  .day {
-    background: var(--surface);
-    border: 1px solid var(--border);
-    border-radius: 0.5rem;
-    overflow: hidden;
-  }
-
-  .day.is-today { border-color: var(--today-border); }
-  .day.is-empty { opacity: 0.6; }
-
-  .day-header {
-    display: flex;
-    justify-content: space-between;
-    align-items: center;
-    padding: 0.5rem 0.875rem;
-    background: var(--surface-alt);
-    border-bottom: 1px solid var(--border);
-  }
-
-  .day.is-today .day-header { background: var(--today-bg); border-bottom-color: var(--today-border); }
-
-  .day-name { font-size: 0.8125rem; font-weight: 600; }
-
-  .day-count {
-    background: var(--count-bg);
-    color: var(--count-text);
-    font-size: 0.7rem;
-    font-weight: 700;
-    padding: 0.1rem 0.45rem;
-    border-radius: 9999px;
-  }
-
-  .day.is-today .day-count { background: var(--today-count-bg); color: var(--today-count-text); }
-
-  .entries { list-style: none; }
-
-  .entry {
-    display: flex;
-    align-items: center;
-    gap: 0.625rem;
-    padding: 0.5rem 0.875rem;
-    border-bottom: 1px solid var(--border-subtle);
-  }
-
-  .entry:last-child { border-bottom: none; }
-
-  .desc { flex: 1; font-size: 0.875rem; line-height: 1.4; }
-
-  .entry-badges { display: flex; gap: 0.3rem; flex-shrink: 0; }
-
-  .empty-day {
-    padding: 0.5rem 0.875rem;
-    font-size: 0.8rem;
-    color: var(--text-faint);
-    font-style: italic;
-  }
-
-  /* ── Action buttons (edit + delete) ───────────────────────────────── */
-  .edit-btn,
-  .del-btn {
-    background: none;
-    border: none;
-    cursor: pointer;
-    line-height: 1;
-    padding: 0.15rem 0.3rem;
-    border-radius: 0.25rem;
-    flex-shrink: 0;
-    opacity: 0;
-    transition: opacity 0.15s, color 0.15s, background 0.15s;
-  }
-
-  .edit-btn { font-size: 0.9rem; color: var(--text-hint); }
-  .del-btn  { font-size: 1.1rem; color: var(--text-hint); }
-
-  .entry:hover .edit-btn,
-  .entry:hover .del-btn  { opacity: 1; }
-
-  .edit-btn:hover { color: #2563eb; background: #dbeafe; }
-  .del-btn:hover  { color: #dc2626; background: #fee2e2; }
-
-  /* ── Inline edit row ──────────────────────────────────────────────── */
-  .entry.is-editing { flex-wrap: nowrap; }
-
-  .edit-row {
-    display: flex;
-    align-items: center;
-    gap: 0.375rem;
-    width: 100%;
-    min-width: 0;
-  }
-
-  .edit-desc {
-    flex: 1;
-    min-width: 0;
-    padding: 0.3rem 0.5rem;
-    border: 1px solid var(--border);
-    border-radius: 0.35rem;
-    font-size: 0.875rem;
-    color: var(--text);
-    background: var(--input-bg);
-  }
-
-  .edit-select {
-    width: auto;
-    padding: 0.3rem 0.4rem;
-    border: 1px solid var(--border);
-    border-radius: 0.35rem;
-    font-size: 0.75rem;
-    color: var(--text);
-    background: var(--input-bg);
-    flex-shrink: 0;
-  }
-
-  .edit-desc:focus, .edit-select:focus {
-    outline: none;
-    border-color: #3b82f6;
-    box-shadow: 0 0 0 2px rgba(59, 130, 246, 0.15);
-  }
-
-  .icon-btn {
-    background: none;
-    border: 1px solid var(--border);
-    border-radius: 0.25rem;
-    width: 1.75rem;
-    height: 1.75rem;
-    cursor: pointer;
-    font-size: 0.75rem;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    flex-shrink: 0;
-    transition: background 0.15s, color 0.15s, border-color 0.15s;
-  }
-
-  .confirm-btn { color: #15803d; border-color: #86efac; background: #f0fdf4; }
-  .confirm-btn:hover { background: #dcfce7; }
-  .cancel-btn  { color: var(--text-faint); }
-  .cancel-btn:hover  { color: #dc2626; background: #fee2e2; border-color: #fca5a5; }
-
-  /* ── Week summary ──────────────────────────────────────────────────── */
-  .week-summary {
-    display: flex;
-    flex-wrap: wrap;
-    gap: 0.75rem;
-    background: var(--surface);
-    border: 1px solid var(--border);
-    border-radius: 0.625rem;
-    padding: 0.75rem 1.25rem;
-    align-items: center;
-  }
-
-  .summary-chip { display: flex; align-items: center; gap: 0.4rem; font-size: 0.875rem; }
-  .summary-chip strong { font-size: 1rem; font-weight: 700; color: var(--summary-text); }
-
   /* ── Badges ────────────────────────────────────────────────────────── */
   .badge {
     display: inline-flex;
@@ -1253,8 +723,6 @@
     white-space: nowrap;
   }
 
-  .cat-badge { background: var(--cat-bg); color: var(--cat-text); }
-
   /*
     Status badge classes applied dynamically — :global() prevents tree-shaking.
   */
@@ -1263,6 +731,140 @@
   :global(.status-next-week)   { background: #dbeafe; color: #1d4ed8; }
   :global(.status-blocker)     { background: #fee2e2; color: #dc2626; }
   :global(.status-achievement) { background: #fef3c7; color: #b45309; }
+
+  /* ── Draft ─────────────────────────────────────────────────────────── */
+  .draft-section {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 0.625rem;
+    overflow: hidden;
+  }
+
+  .draft-toolbar {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 0.5rem 1rem;
+    background: var(--surface-alt);
+    border-bottom: 1px solid var(--border);
+  }
+
+  .draft-label {
+    font-size: 0.75rem;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    color: var(--text-faint);
+  }
+
+  .draft-toolbar-actions { display: flex; align-items: center; gap: 0.625rem; }
+
+  .mode-toggle {
+    display: flex;
+    border: 1px solid var(--border);
+    border-radius: 0.35rem;
+    overflow: hidden;
+  }
+  .mode-toggle button {
+    background: var(--surface);
+    border: none;
+    padding: 0.2rem 0.6rem;
+    font-size: 0.75rem;
+    font-weight: 600;
+    color: var(--text-muted);
+    cursor: pointer;
+    transition: background 0.15s, color 0.15s;
+  }
+  .mode-toggle button + button { border-left: 1px solid var(--border); }
+  .mode-toggle button:hover { background: var(--nav-hover); }
+  .mode-toggle button.active { background: #2563eb; color: #fff; }
+
+  .regen-btn {
+    background: none;
+    border: 1px solid var(--border);
+    border-radius: 0.3rem;
+    padding: 0.2rem 0.6rem;
+    font-size: 0.75rem;
+    font-weight: 600;
+    color: var(--text-muted);
+    cursor: pointer;
+    transition: background 0.15s, color 0.15s;
+  }
+  .regen-btn:hover:not(:disabled) { background: var(--nav-hover); color: var(--text); }
+  .regen-btn:disabled { opacity: 0.45; cursor: not-allowed; }
+
+  .draft-text {
+    display: block;
+    width: 100%;
+    white-space: pre-wrap;
+    font-family: inherit;
+    font-size: 0.875rem;
+    line-height: 1.6;
+    color: var(--text);
+    background: var(--surface);
+    border: none;
+    outline: none;
+    padding: 1rem 1.25rem;
+    min-height: 50vh;
+    resize: vertical;
+  }
+
+  .draft-preview {
+    padding: 1rem 1.25rem;
+    min-height: 50vh;
+    font-size: 0.875rem;
+    line-height: 1.6;
+    color: var(--text);
+    cursor: text;
+  }
+
+  .draft-preview :global(h2),
+  .draft-preview :global(h3),
+  .draft-preview :global(h4) {
+    font-weight: 700;
+    color: var(--text);
+    margin: 1.25rem 0 0.5rem;
+  }
+  .draft-preview :global(h2:first-child),
+  .draft-preview :global(h3:first-child),
+  .draft-preview :global(h4:first-child) { margin-top: 0; }
+
+  .draft-preview :global(h2) { font-size: 1.0625rem; padding-bottom: 0.3rem; border-bottom: 1px solid var(--border); }
+  .draft-preview :global(h3) { font-size: 0.9375rem; }
+  .draft-preview :global(h4) { font-size: 0.8125rem; color: var(--text-muted); margin-left: 1rem; }
+
+  .draft-preview :global(ul) {
+    list-style: none;
+    margin: 0 0 0.75rem;
+  }
+  .draft-preview :global(h4) + :global(ul) { margin-left: 1rem; }
+
+  .draft-preview :global(li) {
+    position: relative;
+    padding: 0.2rem 0 0.2rem 1rem;
+    border-bottom: 1px solid var(--border-subtle);
+  }
+  .draft-preview :global(li:last-child) { border-bottom: none; }
+  .draft-preview :global(li)::before {
+    content: '•';
+    position: absolute;
+    left: 0.15rem;
+    color: var(--text-hint);
+  }
+
+  .draft-preview :global(p) {
+    margin: 0 0 0.5rem;
+    color: var(--text-muted);
+  }
+
+  .draft-preview :global(strong) { color: var(--text); }
+  .draft-preview :global(code) {
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-size: 0.8em;
+    background: var(--surface-alt);
+    border-radius: 0.2rem;
+    padding: 0.05rem 0.3rem;
+  }
 
   /* ── AI Summary ───────────────────────────────────────────────────── */
   .ai-section {
@@ -1374,66 +976,11 @@
   @media (max-width: 800px) {
     header { padding: 0.875rem 1rem; }
 
-    .mobile-tabs {
-      display: flex;
-      position: sticky;
-      top: 0;
-      z-index: 10;
-      background: var(--surface);
-      border-bottom: 1px solid var(--border);
-    }
-
-    .mobile-tabs button {
-      flex: 1;
-      padding: 0.875rem;
-      font-size: 0.9375rem;
-      font-weight: 600;
-      border: none;
-      background: none;
-      color: var(--text-muted);
-      cursor: pointer;
-      border-bottom: 2px solid transparent;
-      transition: color 0.15s, border-color 0.15s;
-    }
-
-    .mobile-tabs button.active {
-      color: #2563eb;
-      border-bottom-color: #2563eb;
-    }
-
-    .layout {
-      grid-template-columns: 1fr;
+    .week-panel {
       padding: 0.75rem 1rem;
       gap: 0.75rem;
     }
 
-    .hidden-mobile { display: none; }
-
-    /* Larger touch targets for edit/delete */
-    .edit-btn,
-    .del-btn {
-      opacity: 1;
-      padding: 0.5rem;
-      min-width: 2.25rem;
-      min-height: 2.25rem;
-      display: flex;
-      align-items: center;
-      justify-content: center;
-    }
-
-    /* Taller textarea on mobile */
-    textarea { min-height: 6rem; }
-
-    /* Bigger submit button */
-    button[type='submit'] {
-      padding: 0.875rem;
-      font-size: 1rem;
-    }
-
-    /* Dense entry rows: keep the Jira key and status, drop epic/domain */
-    .epic-badge, .domain-badge { display: none; }
-
     .sync-card { max-height: 90vh; }
-    .facet-label { width: auto; }
   }
 </style>

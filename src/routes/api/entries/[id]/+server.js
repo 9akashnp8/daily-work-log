@@ -3,32 +3,34 @@ import sql from '$lib/db.js';
 
 export async function PUT({ params, request }) {
   const body = await request.json();
-  const { description, category, status } = body;
+  const { description, status } = body;
 
-  if (!description || !category || !status) {
+  if (!description || !status) {
     return json({ message: 'Missing required fields' }, { status: 400 });
   }
 
   // Only touch `details` when the caller actually sent it — the existing
-  // inline edit sends just {description, category, status}, and must not
+  // inline edit sends just {description, status}, and must not
   // blank out a synced entry's comment-derived details.
   const hasDetails = Object.prototype.hasOwnProperty.call(body, 'details');
 
   const [entry] = hasDetails
     ? await sql`
         UPDATE worklog_entries
-        SET description = ${description}, category = ${category}, status = ${status},
+        SET description = ${description}, status = ${status},
             details = ${body.details ?? null}, user_edited = true
         WHERE id = ${params.id}
-        RETURNING id, date::text, description, details, category, status,
-                  source, jira_key, jira_url, issue_type, epic, project, domain, labels
+        RETURNING id, date::text, description, details, status,
+                  source, jira_key, jira_url, issue_type, epic, project, domain, labels,
+                  issue_summary, parent_key, parent_summary, parent_issue_type, parent_url
       `
     : await sql`
         UPDATE worklog_entries
-        SET description = ${description}, category = ${category}, status = ${status}, user_edited = true
+        SET description = ${description}, status = ${status}, user_edited = true
         WHERE id = ${params.id}
-        RETURNING id, date::text, description, details, category, status,
-                  source, jira_key, jira_url, issue_type, epic, project, domain, labels
+        RETURNING id, date::text, description, details, status,
+                  source, jira_key, jira_url, issue_type, epic, project, domain, labels,
+                  issue_summary, parent_key, parent_summary, parent_issue_type, parent_url
       `;
 
   if (!entry) return json({ message: 'Not found' }, { status: 404 });

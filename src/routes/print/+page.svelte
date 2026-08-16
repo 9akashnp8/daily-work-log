@@ -1,26 +1,6 @@
 <script>
   import { page } from '$app/stores';
-  import { parseSections, formatSlideDate, prevWeekMonday } from '$lib/parseSections.js';
-
-  /**
-   * Convert inline markdown to safe HTML for use with {@html}.
-   * Handles: **bold**, *italic*, `code`, and escapes HTML entities.
-   */
-  function renderInline(text) {
-    return text
-      // Escape HTML entities first to prevent injection
-      .replace(/&/g, '&amp;')
-      .replace(/</g, '&lt;')
-      .replace(/>/g, '&gt;')
-      // Bold: **text** or __text__
-      .replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>')
-      .replace(/__(.+?)__/g, '<strong>$1</strong>')
-      // Italic: *text* or _text_ (not already consumed by bold)
-      .replace(/\*([^*]+?)\*/g, '<em>$1</em>')
-      .replace(/_([^_]+?)_/g, '<em>$1</em>')
-      // Inline code: `code`
-      .replace(/`([^`]+?)`/g, '<code>$1</code>');
-  }
+  import { parseSections, renderInline, formatSlideDate, prevWeekMonday } from '$lib/parseSections.js';
 
   // ── Read week from URL query param (?week=2026-04-13) ────────────────────
   const weekStart = $derived($page.url.searchParams.get('week') ?? '');

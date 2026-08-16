@@ -9,7 +9,7 @@ await sql`
     id           TEXT        PRIMARY KEY,
     date         DATE        NOT NULL,
     description  TEXT        NOT NULL,
-    category     TEXT        NOT NULL,
+    category     TEXT,
     status       TEXT        NOT NULL,
     created_at   TIMESTAMPTZ NOT NULL DEFAULT now()
   )
@@ -40,8 +40,30 @@ await sql`ALTER TABLE worklog_entries ADD COLUMN IF NOT EXISTS details     TEXT`
 await sql`ALTER TABLE worklog_entries ADD COLUMN IF NOT EXISTS user_edited BOOLEAN NOT NULL DEFAULT false`;
 await sql`ALTER TABLE worklog_entries ADD COLUMN IF NOT EXISTS synced_at   TIMESTAMPTZ`;
 
+// `category` (the old manual task-type) is retired — kept for historical rows,
+// never written by the app again.
+await sql`ALTER TABLE worklog_entries ALTER COLUMN category DROP NOT NULL`;
+
+// ── Jira hierarchy columns ─────────────────────────────────────────
+// `issue_summary` is the issue's own stable title (unlike `description`,
+// which is a day-specific synthesized string). The `parent_*` columns are
+// populated only when the issue is a Subtask, and let the UI nest it under
+// its Story even on a day the Story itself had no activity of its own.
+await sql`ALTER TABLE worklog_entries ADD COLUMN IF NOT EXISTS issue_summary     TEXT`;
+await sql`ALTER TABLE worklog_entries ADD COLUMN IF NOT EXISTS parent_key        TEXT`;
+await sql`ALTER TABLE worklog_entries ADD COLUMN IF NOT EXISTS parent_summary    TEXT`;
+await sql`ALTER TABLE worklog_entries ADD COLUMN IF NOT EXISTS parent_issue_type TEXT`;
+await sql`ALTER TABLE worklog_entries ADD COLUMN IF NOT EXISTS parent_url        TEXT`;
+
 await sql`CREATE INDEX IF NOT EXISTS idx_worklog_entries_jira_key ON worklog_entries (jira_key)`;
 await sql`CREATE INDEX IF NOT EXISTS idx_worklog_entries_source   ON worklog_entries (source, date)`;
+
+// `draft` is the user-edited, story-organized markdown that Generate Summary
+// is built from — separate from `summary`, the LLM-generated report. A week
+// can now have a saved draft with no summary generated yet, so `summary`
+// drops its NOT NULL.
+await sql`ALTER TABLE worklog_reports ADD COLUMN IF NOT EXISTS draft TEXT`;
+await sql`ALTER TABLE worklog_reports ALTER COLUMN summary DROP NOT NULL`;
 
 // One Jira issue can only produce one row per day (belt-and-braces alongside
 // the deterministic id `jira:{key}:{date}` used by the sync route).
@@ -57,8 +79,8 @@ if (process.argv[2]) {
   let count = 0;
   for (const e of entries) {
     await sql`
-      INSERT INTO worklog_entries (id, date, description, category, status)
-      VALUES (${e.id}, ${e.date}, ${e.description}, ${e.category}, ${e.status})
+      INSERT INTO worklog_entries (id, date, description, status)
+      VALUES (${e.id}, ${e.date}, ${e.description}, ${e.status})
       ON CONFLICT (id) DO NOTHING
     `;
     count++;

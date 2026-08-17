@@ -222,11 +222,12 @@ async function applySync(week, result, fullHistory) {
         INSERT INTO worklog_entries
           (id, date, description, details, status, source, jira_key, jira_url,
            issue_type, epic, project, domain, labels, issue_summary, parent_key,
-           parent_summary, parent_issue_type, parent_url, synced_at)
+           parent_summary, parent_issue_type, parent_url, signal, synced_at)
         VALUES (${e.id}, ${e.date}, ${e.description}, ${e.details}, ${e.status}, 'jira',
                 ${e.jira_key}, ${e.jira_url}, ${e.issue_type}, ${e.epic}, ${e.project},
                 ${e.domain}, ${e.labels}, ${e.issue_summary}, ${e.parent_key},
-                ${e.parent_summary}, ${e.parent_issue_type}, ${e.parent_url}, now())
+                ${e.parent_summary}, ${e.parent_issue_type}, ${e.parent_url},
+                ${e.signal ?? null}, now())
         ON CONFLICT (id) DO UPDATE SET
           date = EXCLUDED.date, description = EXCLUDED.description, details = EXCLUDED.details,
           status = EXCLUDED.status,
@@ -235,7 +236,7 @@ async function applySync(week, result, fullHistory) {
           domain = EXCLUDED.domain, labels = EXCLUDED.labels,
           issue_summary = EXCLUDED.issue_summary, parent_key = EXCLUDED.parent_key,
           parent_summary = EXCLUDED.parent_summary, parent_issue_type = EXCLUDED.parent_issue_type,
-          parent_url = EXCLUDED.parent_url, synced_at = now()
+          parent_url = EXCLUDED.parent_url, signal = EXCLUDED.signal, synced_at = now()
         WHERE worklog_entries.user_edited = false
         RETURNING (xmax = 0) AS inserted
       `;
@@ -274,7 +275,8 @@ async function applySync(week, result, fullHistory) {
   const entries = await sql`
     SELECT id, date::text, description, details, status,
            source, jira_key, jira_url, issue_type, epic, project, domain, labels,
-           issue_summary, parent_key, parent_summary, parent_issue_type, parent_url
+           issue_summary, parent_key, parent_summary, parent_issue_type, parent_url,
+           signal
     FROM worklog_entries
     WHERE date BETWEEN ${week}::date AND ${sunday}::date
     ORDER BY date, created_at

@@ -13,7 +13,8 @@ export async function GET({ url }) {
   const entries = await sql`
     SELECT id, date::text, description, details, status,
            source, jira_key, jira_url, issue_type, epic, project, domain, labels,
-           issue_summary, parent_key, parent_summary, parent_issue_type, parent_url
+           issue_summary, parent_key, parent_summary, parent_issue_type, parent_url,
+           signal
     FROM worklog_entries
     WHERE date BETWEEN ${week}::date AND ${sundayStr}::date
     ORDER BY date, created_at

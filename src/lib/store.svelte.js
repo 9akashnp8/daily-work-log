@@ -71,6 +71,26 @@ class WorklogStore {
     this.syncError = null;
   }
 
+  /**
+   * Fresh entries computed straight from Jira, WITHOUT touching the database.
+   * `mode: 'preview'` already does exactly this work server-side — it runs the
+   * full discovery-JQL → changelog → comments → mapping pipeline and returns
+   * the resulting rows, writing nothing. Reusing it lets the draft be rebuilt
+   * from live Jira while leaving the "preview, then Apply" safety model of the
+   * Sync button completely untouched. Throws so the caller can fall back to
+   * the last synced data.
+   */
+  async fetchJiraEntries(week) {
+    const res = await fetch('/api/sync/jira', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ week, mode: 'preview' })
+    });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.message || 'Failed to fetch from Jira');
+    return data;
+  }
+
   async loadWeek(weekMonday) {
     this.loading = true;
     this.error = null;

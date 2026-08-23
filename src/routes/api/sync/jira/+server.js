@@ -99,7 +99,7 @@ async function computeSync(week, fullHistory) {
   }
 
   if (!issues.length) {
-    return { jql, entries: [], warnings, issuesSeen: 0, issuesSuppressed: 0, commentEntries: 0, continuedEntries: 0 };
+    return { jql, entries: [], warnings, issuesSeen: 0, issuesSuppressed: 0, issuesDropped: 0, commentEntries: 0, continuedEntries: 0 };
   }
 
   const issueKeys = issues.map((i) => i.key);
@@ -113,7 +113,7 @@ async function computeSync(week, fullHistory) {
     fetchCommentsForIssues(issueKeys, from, to, me.accountId)
   ]);
 
-  const { entries, suppressedCount, commentEntryCount, continuedCount } = mapIssuesToEntries({
+  const { entries, suppressedCount, commentEntryCount, continuedCount, droppedKeys } = mapIssuesToEntries({
     issues,
     transitionsByKey,
     commentsByKey,
@@ -138,6 +138,7 @@ async function computeSync(week, fullHistory) {
     warnings,
     issuesSeen: issues.length,
     issuesSuppressed: suppressedCount,
+    issuesDropped: droppedKeys.length,
     commentEntries: commentEntryCount,
     continuedEntries: continuedCount
   };
@@ -193,6 +194,7 @@ async function buildPreview(week, result, fullHistory) {
       remove: removing.length,
       issuesSeen: result.issuesSeen,
       issuesSuppressed: result.issuesSuppressed,
+      issuesDropped: result.issuesDropped,
       comments: result.commentEntries,
       continued: result.continuedEntries
     },

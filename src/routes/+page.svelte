@@ -65,6 +65,8 @@
 
   let draft         = $state('');
   let draftMode     = $state('preview'); // 'preview' | 'edit' — resets on week change
+  let regenerating  = $state(false);
+  let regenNote     = $state(''); // what the last regenerate pulled, plus any warnings
   let summarizing    = $state(false);
   let summary        = $state('');
   let summaryError   = $state('');
@@ -78,7 +80,7 @@
   $effect(() => {
     const week = weekDays[0];
     const label = weekLabel;
-    summary = ''; summaryError = ''; draft = ''; draftMode = 'preview';
+    summary = ''; summaryError = ''; draft = ''; draftMode = 'preview'; regenNote = '';
     (async () => {
       const [, reportData] = await Promise.all([
         store.loadWeek(week),
@@ -106,9 +108,46 @@
     draftSaveTimer = setTimeout(() => persistReport(weekDays[0], { draft }), 400);
   }
 
-  function regenerateFromJira() {
-    draft = buildDraftMarkdown(store.entries, weekLabel);
-    persistReport(weekDays[0], { draft });
+  /**
+   * Rebuilds the draft from LIVE Jira, not from whatever the last sync left in
+   * the database — the button has always been labelled "from Jira" but used to
+   * re-render `store.entries`, so a ticket the last sync never captured could
+   * not be recovered by pressing it.
+   *
+   * Rows the sync marks `skip` are ones you hand-edited; those keep their local
+   * text, since a regenerate must never quietly discard your own wording.
+   * Manual (non-Jira) entries are folded back in for the same reason. If Jira
+   * is unreachable or unconfigured we still rebuild from the local data, so the
+   * button degrades to its old behaviour rather than failing outright.
+   */
+  async function regenerateFromJira() {
+    const week = weekDays[0];
+    regenerating = true;
+    regenNote = '';
+    try {
+      const fresh = await store.fetchJiraEntries(week);
+      const localById = new Map(store.entries.map(e => [e.id, e]));
+      const jiraRows = fresh.entries.map(e =>
+        e.action === 'skip' && localById.has(e.id) ? localById.get(e.id) : e
+      );
+      const manualRows = store.entries.filter(e => e.source !== 'jira');
+      draft = buildDraftMarkdown([...jiraRows, ...manualRows], weekLabel);
+      regenNote = summariseFetch(fresh);
+    } catch (e) {
+      draft = buildDraftMarkdown(store.entries, weekLabel);
+      regenNote = `Could not reach Jira (${e.message}) — rebuilt from the last synced data.`;
+    } finally {
+      regenerating = false;
+      if (week === weekDays[0]) await persistReport(week, { draft });
+    }
+  }
+
+  /** "18 issues from Jira · 3 produced no entry" + any server warnings. */
+  function summariseFetch({ stats, warnings }) {
+    const bits = [`${stats.issuesSeen} issue${stats.issuesSeen === 1 ? '' : 's'} from Jira`];
+    if (stats.issuesSuppressed) bits.push(`${stats.issuesSuppressed} suppressed as parents`);
+    if (stats.issuesDropped) bits.push(`${stats.issuesDropped} produced no entry`);
+    return [bits.join(' · '), ...(warnings ?? [])].join('\n');
   }
 
   async function generateSummary() {
@@ -192,6 +231,17 @@
             {#if p.stats.continued}
               <span class="sync-stat sync-stat-continued">{p.stats.continued} continued</span>
             {/if}
+            <!-- The denominator: without it, "Jira returned 23 issues and 9
+                 became nothing" is invisible and the sync looks like it just
+                 silently missed tickets. -->
+            <span class="sync-stat sync-stat-seen" title="Issues the discovery JQL returned">
+              {p.stats.issuesSeen} from Jira
+            </span>
+            {#if p.stats.issuesDropped}
+              <span class="sync-stat sync-stat-dropped" title="Matched the JQL but produced no entry — see warnings">
+                {p.stats.issuesDropped} no entry
+              </span>
+            {/if}
           </div>
 
           {#if p.warnings?.length}
@@ -270,13 +320,20 @@
           <button
             class="regen-btn"
             onclick={regenerateFromJira}
-            disabled={store.entries.length === 0}
-            title="Rebuild from current Jira data — overwrites this text"
+            disabled={regenerating}
+            title="Fetch this week fresh from Jira and rebuild these notes — overwrites this text"
           >
-            ↺ Regenerate from Jira
+            {#if regenerating}
+              <span class="spinner"></span> Fetching…
+            {:else}
+              ↺ Regenerate from Jira
+            {/if}
           </button>
         </div>
       </div>
+      {#if regenNote}
+        <p class="regen-note">{regenNote}</p>
+      {/if}
       {#if draftMode === 'edit'}
         <textarea
           class="draft-text"
@@ -565,6 +622,8 @@
   .sync-stat-remove    { background: #fee2e2; color: #dc2626; }
   .sync-stat-comment   { background: #f3e8ff; color: #7c3aed; }
   .sync-stat-continued { background: var(--cat-bg); color: var(--text-faint); }
+  .sync-stat-seen      { background: var(--cat-bg); color: var(--text-muted); }
+  .sync-stat-dropped   { background: #fef3c7; color: #b45309; }
 
   .sync-warnings {
     list-style: none;
@@ -793,6 +852,18 @@
   }
   .regen-btn:hover:not(:disabled) { background: var(--nav-hover); color: var(--text); }
   .regen-btn:disabled { opacity: 0.45; cursor: not-allowed; }
+
+  /* One line per warning — the server returns them newline-joined. */
+  .regen-note {
+    margin: 0;
+    padding: 0.5rem 1rem;
+    border-bottom: 1px solid var(--border);
+    background: var(--surface-alt);
+    font-size: 0.75rem;
+    line-height: 1.5;
+    color: var(--text-muted);
+    white-space: pre-wrap;
+  }
 
   .draft-text {
     display: block;

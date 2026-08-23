@@ -68,16 +68,19 @@ const DEFAULT_BLOCKER_LABELS = ['blocked', 'blocker', 'impediment'];
 /**
  * Drops any issue that is the `parent` of another issue in the same result
  * set — a moved sub-task should be logged, not its parent story/epic too.
- * Exception: a parent carrying your own comments is re-admitted, since the
- * discovery JQL's `updated` clause now pulls in far more parent stories, and
- * a blanket drop would otherwise suppress a story you wrote notes on in
- * favour of a sub-task that only got a field edit.
+ * Exception: a parent with activity of its OWN inside the window is
+ * re-admitted. "Activity" is your comments *or* its own status/flag
+ * transitions: a story you personally dragged Backlog → In Progress → Done
+ * is work you did, and dropping it just because one of its sub-tasks also
+ * moved lost that whole transition chain from the report.
  * Returns { kept, suppressed } where suppressed is a list of dropped keys
  * (for the preview's warnings).
  */
-export function suppressParents(issues, commentsByKey = new Map()) {
+export function suppressParents(issues, commentsByKey = new Map(), transitionsByKey = new Map()) {
   const parentKeys = new Set(issues.map((i) => i.fields.parent?.key).filter(Boolean));
-  const isSuppressed = (i) => parentKeys.has(i.key) && !(commentsByKey.get(i.key)?.length);
+  const hasOwnActivity = (key) =>
+    Boolean(commentsByKey.get(key)?.length) || Boolean(transitionsByKey.get(key)?.length);
+  const isSuppressed = (i) => parentKeys.has(i.key) && !hasOwnActivity(i.key);
   const kept = issues.filter((i) => !isSuppressed(i));
   const suppressed = issues.filter(isSuppressed).map((i) => i.key);
   return { kept, suppressed };
@@ -345,13 +348,18 @@ function isFallbackEnabled() {
   return v !== '0' && v !== 'false';
 }
 
-/** `mapped === 'in-progress'` via STATUS_MAP wins as a precise veto (e.g. an
- *  indeterminate-category "Waiting on Client" status is not your work);
- *  falling back to statusCategory keeps the check instance-agnostic. */
-function isActiveForFallback(issue) {
-  const mapped = mapStatusName(issue.fields.status?.name);
-  if (mapped !== undefined) return mapped === 'in-progress';
-  return issue.fields.status?.statusCategory?.key === 'indeterminate';
+/**
+ * Work that was already finished BEFORE the window opened is the one class of
+ * issue the fallback must still refuse: the discovery JQL's `updated` clause
+ * happily matches a closed ticket that got a stray field edit or a bot
+ * comment this week, and logging that as the week's work is just wrong.
+ * Everything else — To Do, In Review, Waiting on Client, Blocked — is a
+ * ticket that was genuinely open on your plate, so it belongs in the report
+ * even on a week when it did not move.
+ */
+function wasResolvedBeforeWindow(issue, weekMonday) {
+  const resolved = issue.fields.resolutiondate;
+  return Boolean(resolved) && resolved.slice(0, 10) < weekMonday;
 }
 
 function fallbackDate(weekMonday) {
@@ -366,21 +374,30 @@ function fallbackDate(weekMonday) {
  * The silent-ticket fallback: an issue the discovery JQL returned but which
  * produced no comment and no transition anywhere in the window still gets
  * ONE entry, so a multi-week ticket nobody touched that particular week
- * never silently vanishes from the report — but only when it's unambiguously
- * yours and currently active, to keep bot edits and other people's activity
- * out of the log.
+ * never silently vanishes from the report. Gated on the issue being
+ * unambiguously yours (assignee) and not already closed before the window —
+ * that pair is enough to keep bot edits and other people's activity out,
+ * without also discarding every open ticket that merely wasn't "In Progress".
+ *
+ * The status is mapped from the issue's real Jira status rather than pinned
+ * to 'in-progress': now that a To Do / In Review / Blocked ticket can reach
+ * here, claiming they were all in progress would be a lie in the report.
  */
 function buildContinuedEntry(issue, weekMonday, myAccountId, warnings) {
   if (!isFallbackEnabled()) return null;
   if (!myAccountId || issue.fields.assignee?.accountId !== myAccountId) return null;
-  if (!isActiveForFallback(issue)) return null;
+  if (wasResolvedBeforeWindow(issue, weekMonday)) return null;
 
   const summary = issue.fields.summary ?? issue.key;
   const statusName = issue.fields.status?.name ?? 'In Progress';
+  // A Backlog-like status maps to null ("not work"); here it means a ticket
+  // parked on your plate, which reads as next-week rather than nothing.
+  const status = statusForCarryForward(statusName, issue) ?? 'next-week';
+
   return {
     date: fallbackDate(weekMonday),
-    status: 'in-progress',
-    description: capDescription(`${summary} — continued (still ${statusName})`),
+    status,
+    description: capDescription(`${summary} — still ${statusName}`),
     details: null,
     signal: 'continued'
   };
@@ -396,13 +413,18 @@ export function mapIssuesToEntries({
   fullHistory = false
 }) {
   const commentsByKeySafe = commentsByKey ?? new Map();
-  const { kept, suppressed } = suppressParents(issues, commentsByKeySafe);
+  const { kept, suppressed } = suppressParents(issues, commentsByKeySafe, transitionsByKey);
   suppressed.forEach((key) =>
     warnings.push(`${key} suppressed — a sub-task under it also had activity this week`)
   );
 
   const unmatchedLabels = new Set();
   const entries = [];
+  // Issues the discovery JQL returned that end up producing no row at all.
+  // Previously these vanished with no trace in the stats or the warnings,
+  // which made "the sync is missing tickets" impossible to diagnose from the
+  // preview alone — collected here so the caller can report them.
+  const droppedKeys = [];
   let commentEntryCount = 0;
   let continuedCount = 0;
 
@@ -433,6 +455,8 @@ export function mapIssuesToEntries({
       const fb = buildContinuedEntry(issue, weekMonday, myAccountId, warnings);
       if (fb) dayResults.push(fb);
     }
+
+    if (!dayResults.length) droppedKeys.push(issue.key);
 
     for (const d of dayResults) {
       let status = d.status;
@@ -471,7 +495,14 @@ export function mapIssuesToEntries({
     );
   }
 
+  if (droppedKeys.length) {
+    warnings.push(
+      `${droppedKeys.length} issue(s) matched the JQL but produced no entry — ` +
+        `no in-window activity and not assigned to you, or closed before this week: ${droppedKeys.join(', ')}`
+    );
+  }
+
   entries.sort((a, b) => (a.date === b.date ? a.jira_key.localeCompare(b.jira_key) : a.date < b.date ? -1 : 1));
 
-  return { entries, suppressedCount: suppressed.length, commentEntryCount, continuedCount };
+  return { entries, suppressedCount: suppressed.length, commentEntryCount, continuedCount, droppedKeys };
 }
